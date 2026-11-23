@@ -1,6 +1,7 @@
 import type {
   AppSettings,
   ClassificationRule,
+  DiagnosticsInfo,
   EmailAccount,
   EmailDetail,
   EmailListResponse,
@@ -159,4 +160,12 @@ export const mailApi = {
   resetDemo: () => request<{ ok: boolean }>('/system/demo/reset', { method: 'POST' }),
   clearDemo: () => request<{ removed_accounts: number }>('/system/demo/clear', { method: 'POST' }),
   getNotifications: () => request<SyncLogItem[]>('/notifications'),
+  getDiagnostics: (eventId?: string) =>
+    request<DiagnosticsInfo>(
+      eventId ? `/system/diagnostics?event_id=${encodeURIComponent(eventId)}` : '/system/diagnostics',
+    ),
+  getDiagnosticBundleUrl: (eventId?: string) =>
+    eventId
+      ? `${API_BASE}/system/diagnostics/bundle?event_id=${encodeURIComponent(eventId)}`
+      : `${API_BASE}/system/diagnostics/bundle`,
 }

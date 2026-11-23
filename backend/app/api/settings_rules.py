@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -9,9 +9,11 @@ from app.schema.schemas import (
     ClassificationRuleCreate,
     ClassificationRuleOut,
     ClassificationRuleUpdate,
+    DiagnosticsOut,
     StorageInfoOut,
     SyncLogOut,
 )
+from app.service.diagnostics_service import diagnostics_service
 from app.service.system_service import system_service
 
 router = APIRouter(tags=["settings-and-system"])
@@ -142,3 +144,29 @@ def clear_demo(db: Session = Depends(get_db)) -> dict[str, int]:
 def get_notifications(db: Session = Depends(get_db)) -> list[SyncLogOut]:
     """读取同步与系统提醒日志。"""
     return system_service.list_notifications(db)
+
+
+@router.get("/system/diagnostics", response_model=DiagnosticsOut)
+def get_diagnostics(
+    event_id: str | None = None,
+    db: Session = Depends(get_db),
+) -> DiagnosticsOut:
+    """生成用于精准排查 Issue 的脱敏运行态诊断信息与 Markdown 报告。"""
+    return diagnostics_service.collect_diagnostics(db, event_id=event_id)
+
+
+@router.get("/system/diagnostics/bundle")
+def download_diagnostic_bundle(
+    event_id: str | None = None,
+    db: Session = Depends(get_db),
+) -> Response:
+    """下载脱敏后的可附带至 GitHub Issue 的诊断压缩包 (.zip)。"""
+    filename, zip_bytes = diagnostics_service.build_diagnostic_bundle_zip(db, event_id=event_id)
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )

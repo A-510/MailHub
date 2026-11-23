@@ -111,7 +111,7 @@ export const useMailStore = defineStore('mailhub', () => {
     textBody?: string
   } | null>(null)
   const settingsOpen = ref(false)
-  const settingsTab = ref<'accounts' | 'appearance' | 'sync' | 'notifications' | 'privacy'>('accounts')
+  const settingsTab = ref<'accounts' | 'appearance' | 'sync' | 'notifications' | 'privacy' | 'diagnostics'>('accounts')
   const readingFullscreen = ref(false)
 
   // 首次使用新手引导状态

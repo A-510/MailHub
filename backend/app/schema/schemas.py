@@ -361,3 +361,69 @@ class SyncLogOut(BaseModel):
     fetched_count: int
     message: str
     created_at: UtcDatetime
+
+
+class DiagnosticsAccountSummary(BaseModel):
+    """脱敏后的邮箱渠道诊断摘要（不含明文邮箱全称或凭据）。"""
+
+    id: int
+    provider: str
+    auth_type: str
+    masked_email: str
+    imap_host: str
+    imap_port: int
+    imap_ssl: bool
+    smtp_host: str
+    smtp_port: int
+    smtp_ssl: bool
+    is_enabled: bool
+    is_demo: bool
+    sync_status: str
+    last_synced_at: UtcDatetime | None
+    last_error: str | None
+
+
+class DiagnosticsSettingsSummary(BaseModel):
+    """脱敏后的运行设置摘要。"""
+
+    theme_mode: str
+    motion_level: str
+    sync_interval_minutes: int
+    sync_days: int
+    undo_send_seconds: int
+    block_remote_images: bool
+    oauth_google_configured: bool
+    oauth_microsoft_configured: bool
+
+
+class DiagnosticsSyncLogSummary(BaseModel):
+    """脱敏后的同步日志摘要。"""
+
+    status: str
+    fetched_count: int
+    message: str
+    created_at: UtcDatetime
+
+
+class DiagnosticsOut(BaseModel):
+    """用于 Issue 排障的脱敏诊断快照与 Markdown 报告。"""
+
+    event_id: str
+    generated_at: UtcDatetime
+    app_name: str
+    app_version: str
+    git_commit: str | None
+    os_info: str
+    python_version: str
+    arch: str
+    host: str
+    port: int
+    frontend_dist_ready: bool
+    secret_key_mode: Literal["env", "file", "missing"]
+    storage: StorageInfoOut
+    settings_summary: DiagnosticsSettingsSummary
+    accounts: list[DiagnosticsAccountSummary]
+    recent_sync_logs: list[DiagnosticsSyncLogSummary]
+    backend_log_lines: list[str]
+    launcher_log_lines: list[str]
+    markdown_report: str

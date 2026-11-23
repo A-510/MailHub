@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 📖 阅读 README 常见问题 (FAQ)
+    url: https://github.com/A-510/MailHub#常见问题
+    about: 查看 QQ/163/Gmail/Outlook 授权、端口回退、启动器守护与无图降级等常见解答
+  - name: 📮 邮箱渠道与 OAuth2 配置指南
+    url: https://github.com/A-510/MailHub/blob/main/docs/guide/email-providers-and-oauth2.md
+    about: 查看各大邮箱授权码获取方式、Google / Microsoft OAuth2 PKCE 回调配置与常见报错对照

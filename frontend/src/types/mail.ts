@@ -157,3 +157,61 @@ export interface SyncLogItem {
   message: string
   created_at: string
 }
+
+export interface DiagnosticsAccountSummary {
+  id: number
+  provider: string
+  auth_type: string
+  masked_email: string
+  imap_host: string
+  imap_port: number
+  imap_ssl: boolean
+  smtp_host: string
+  smtp_port: number
+  smtp_ssl: boolean
+  is_enabled: boolean
+  is_demo: boolean
+  sync_status: string
+  last_synced_at: string | null
+  last_error: string | null
+}
+
+export interface DiagnosticsSettingsSummary {
+  theme_mode: string
+  motion_level: string
+  sync_interval_minutes: number
+  sync_days: number
+  undo_send_seconds: number
+  block_remote_images: boolean
+  oauth_google_configured: boolean
+  oauth_microsoft_configured: boolean
+}
+
+export interface DiagnosticsSyncLogSummary {
+  status: string
+  fetched_count: number
+  message: string
+  created_at: string
+}
+
+export interface DiagnosticsInfo {
+  event_id: string
+  generated_at: string
+  app_name: string
+  app_version: string
+  git_commit: string | null
+  os_info: string
+  python_version: string
+  arch: string
+  host: string
+  port: number
+  frontend_dist_ready: boolean
+  secret_key_mode: 'env' | 'file' | 'missing'
+  storage: StorageInfo
+  settings_summary: DiagnosticsSettingsSummary
+  accounts: DiagnosticsAccountSummary[]
+  recent_sync_logs: DiagnosticsSyncLogSummary[]
+  backend_log_lines: string[]
+  launcher_log_lines: string[]
+  markdown_report: string
+}

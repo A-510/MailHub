@@ -1424,3 +1424,145 @@ async def test_oauth_callback_resolves_outlook_preferred_username_and_replaces_d
         assert saved.smtp_ssl is False
 
 
+def test_diagnostics_sanitization_and_bundle_export(
+    client: TestClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证诊断报告与诊断包导出接口能彻底脱敏路径、邮箱前缀与凭据，绝不泄露隐私数据。"""
+    import io
+    import json
+    import zipfile
+    from app.service.diagnostics_service import mask_email, sanitize_text
+
+    assert mask_email("alice.wang@qq.com") == "a***@qq.com"
+    assert mask_email("u@163.com") == "u***@163.com"
+
+    fake_root = tmp_path / "repo_root"
+    fake_home = Path(r"C:\Users\SecretTester")
+    raw_text = (
+        f"Failed at {fake_root}\\backend\\app\\main.py from C:\\Users\\SecretTester\\Desktop "
+        "for user secret_user@163.com Bearer my_jwt_token_123 "
+        "password=super_secret_pw client_secret='oauth_sec_999' "
+        "token=gAAAAABn1234567890abcdefghijklmnopqrstuvwxyz1234567890 on WORKSTATION-PC"
+    )
+    sanitized = sanitize_text(
+        raw_text,
+        project_root=fake_root,
+        home_dir=fake_home,
+        hostname="WORKSTATION-PC",
+    )
+    assert "SecretTester" not in sanitized
+    assert str(fake_root) not in sanitized
+    assert "secret_user@" not in sanitized
+    assert "s***@163.com" in sanitized
+    assert "my_jwt_token_123" not in sanitized
+    assert "super_secret_pw" not in sanitized
+    assert "oauth_sec_999" not in sanitized
+    assert "gAAAAABn" not in sanitized
+    assert "WORKSTATION-PC" not in sanitized
+    assert "<PROJECT_ROOT>" in sanitized
+    assert "<USER_HOME>" in sanitized
+    assert "<HOST>" in sanitized
+
+    # 模拟存在测试账号、OAuth 配置与包含敏感字符串的日志
+    client.patch(
+        "/api/v1/settings",
+        json={
+            "oauth_google_client_id": "secret-google-client-id.apps.googleusercontent.com",
+            "oauth_google_client_secret": "super-secret-google-client-secret",
+        },
+    )
+    with SessionLocal() as db:
+        acc = Account(
+            label="私人主邮箱",
+            email="private.owner@163.com",
+            provider="163",
+            auth_type="password",
+            encrypted_secret="gAAAAABnSecretCipherTextValueShouldNeverLeak1234567890",
+            imap_host="imap.163.com",
+            imap_port=993,
+            imap_ssl=True,
+            smtp_host="smtp.163.com",
+            smtp_port=465,
+            smtp_ssl=True,
+            sync_status="error",
+            last_error="Auth fail for private.owner@163.com token=secret_abc_123",
+            is_demo=False,
+        )
+        account_repo.create(db, acc)
+        account_repo.add_sync_log(
+            db,
+            account_id=acc.id,
+            status="error",
+            fetched_count=0,
+            message=r"连接 C:\Users\Alice\mail 失败: password=my_auth_code_99",
+        )
+
+    backend_log = tmp_path / "backend.log"
+    launcher_log = tmp_path / "launcher.log"
+    backend_log.write_text(
+        "2026-11-23 15:00:00 | ERROR | app.sync | login private.owner@163.com code=xyz987\n",
+        encoding="utf-8",
+    )
+    launcher_log.write_text(
+        "2026-11-23 15:00:01 | INFO | launcher | started from /Users/alice/MailHub\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(type(settings), "backend_log_path", property(lambda _self: backend_log))
+    monkeypatch.setattr(type(settings), "launcher_log_path", property(lambda _self: launcher_log))
+
+    health_resp = client.get("/api/v1/health")
+    assert health_resp.status_code == 200
+    assert health_resp.json()["version"] == settings.app_version
+
+    diag_resp = client.get("/api/v1/system/diagnostics")
+    assert diag_resp.status_code == 200
+    diag = diag_resp.json()
+    assert diag["event_id"].startswith("MH-")
+    assert diag["app_version"] == settings.app_version
+    assert diag["settings_summary"]["oauth_google_configured"] is True
+    assert diag["settings_summary"]["oauth_microsoft_configured"] is False
+
+    report_md = diag["markdown_report"]
+    assert "private.owner@" not in report_md
+    assert "p***@163.com" in report_md
+    assert "secret-google-client-id" not in report_md
+    assert "super-secret-google-client-secret" not in report_md
+    assert "secret_abc_123" not in report_md
+    assert "my_auth_code_99" not in report_md
+    assert "xyz987" not in report_md
+    assert "<USER_HOME>" in report_md
+
+    bundle_resp = client.get(f"/api/v1/system/diagnostics/bundle?event_id={diag['event_id']}")
+    assert bundle_resp.status_code == 200
+    assert bundle_resp.headers["content-type"] == "application/zip"
+    assert f"mailhub-diagnostics-{diag['event_id']}.zip" in bundle_resp.headers.get("content-disposition", "")
+
+    # 恶意/非法 event_id 参数不应渗透到文件名或报告中
+    bad_bundle_resp = client.get("/api/v1/system/diagnostics/bundle?event_id=../../evil")
+    assert bad_bundle_resp.status_code == 200
+    assert "evil" not in bad_bundle_resp.headers.get("content-disposition", "")
+
+    with zipfile.ZipFile(io.BytesIO(bundle_resp.content), "r") as zf:
+        names = set(zf.namelist())
+        assert {
+            "README-PRIVACY.txt",
+            "diagnostic-report.md",
+            "diagnostics.json",
+            "backend.log.txt",
+            "launcher.log.txt",
+        }.issubset(names)
+        assert "mailhub.db" not in names
+        assert ".secret.key" not in names
+
+        parsed_json = json.loads(zf.read("diagnostics.json").decode("utf-8"))
+        assert parsed_json["event_id"] == diag["event_id"]
+        for member in names:
+            content = zf.read(member).decode("utf-8")
+            assert "private.owner@" not in content
+            assert "my_auth_code_99" not in content
+            assert "super-secret-google-client-secret" not in content
+
+
+

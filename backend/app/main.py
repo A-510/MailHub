@@ -38,7 +38,7 @@ def create_app() -> FastAPI:
     """构建并返回 FastAPI 应用实例。"""
     application = FastAPI(
         title="MailHub API",
-        version="1.0.0",
+        version=settings.app_version,
         description="MailHub 多邮箱聚合书籍客户端后端服务",
         lifespan=lifespan,
     )
@@ -59,7 +59,11 @@ def create_app() -> FastAPI:
     @application.get("/api/v1/health")
     def health_check() -> dict[str, str]:
         """健康检查接口，供启动器检测服务就绪状态。"""
-        return {"status": "ok", "app": settings.app_name}
+        return {
+            "status": "ok",
+            "app": settings.app_name,
+            "version": settings.app_version,
+        }
 
     application.include_router(accounts_router, prefix="/api/v1")
     application.include_router(emails_router, prefix="/api/v1")

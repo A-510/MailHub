@@ -5,11 +5,14 @@ import {
   ArrowDown,
   ArrowUp,
   Bell,
+  Bug,
   CheckCircle2,
+  Copy,
   Database,
   ExternalLink,
   Globe,
   HardDriveDownload,
+  Info,
   MailPlus,
   Palette,
   RefreshCw,
@@ -24,7 +27,7 @@ import { mailApi } from '@/api/client'
 import { useMailStore } from '@/stores/mailStore'
 import { useTheme } from '@/composables/useTheme'
 import { useBookMotion } from '@/composables/useBookMotion'
-import type { EmailAccount, ProviderType, StorageInfo } from '@/types/mail'
+import type { DiagnosticsInfo, EmailAccount, ProviderType, StorageInfo } from '@/types/mail'
 
 const store = useMailStore()
 const { setThemeWithTransition } = useTheme()
@@ -36,6 +39,7 @@ const tabs = [
   { id: 'sync', label: '收发与规则', icon: Sliders },
   { id: 'notifications', label: '通知提醒', icon: Bell },
   { id: 'privacy', label: '隐私与数据', icon: Shield },
+  { id: 'diagnostics', label: '关于与诊断', icon: Info },
 ] as const
 
 // 添加邮箱表单状态
@@ -90,6 +94,15 @@ const newRule = reactive({
 })
 
 const storageInfo = ref<StorageInfo | null>(null)
+const diagnosticsInfo = ref<DiagnosticsInfo | null>(null)
+const loadingDiagnostics = ref(false)
+const diagnosticsError = ref('')
+
+const GITHUB_REPO_URL = 'https://github.com/A-510/MailHub'
+const GITHUB_ISSUES_URL = 'https://github.com/A-510/MailHub/issues/new/choose'
+const GITHUB_FAQ_URL = 'https://github.com/A-510/MailHub#%E5%B8%B8%E8%A7%81%E9%97%AE%E9%A2%98'
+const GITHUB_PROVIDER_GUIDE_URL =
+  'https://github.com/A-510/MailHub/blob/main/docs/guide/email-providers-and-oauth2.md'
 
 const currentPreset = computed(() =>
   store.providers.find((p) => p.id === newForm.provider) ?? null,
@@ -449,6 +462,69 @@ async function loadStorage(): Promise<void> {
   storageInfo.value = await mailApi.getStorageInfo()
 }
 
+async function loadDiagnostics(): Promise<void> {
+  loadingDiagnostics.value = true
+  diagnosticsError.value = ''
+  try {
+    diagnosticsInfo.value = await mailApi.getDiagnostics()
+  } catch (err) {
+    diagnosticsError.value = (err as Error).message
+  } finally {
+    loadingDiagnostics.value = false
+  }
+}
+
+async function copyTextSafe(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    // 回退至隐藏文本域复制
+  }
+  try {
+    const area = document.createElement('textarea')
+    area.value = text
+    area.setAttribute('readonly', '')
+    area.style.position = 'fixed'
+    area.style.opacity = '0'
+    document.body.appendChild(area)
+    area.select()
+    const copied = document.execCommand('copy')
+    document.body.removeChild(area)
+    return copied
+  } catch {
+    return false
+  }
+}
+
+async function handleCopyEventId(): Promise<void> {
+  if (!diagnosticsInfo.value) return
+  const ok = await copyTextSafe(diagnosticsInfo.value.event_id)
+  store.pushToast(ok ? `已复制 Event ID：${diagnosticsInfo.value.event_id}` : '复制失败，请手动选中复制', ok ? 'success' : 'error')
+}
+
+async function handleCopyDiagnosticReport(): Promise<void> {
+  if (!diagnosticsInfo.value) return
+  const ok = await copyTextSafe(diagnosticsInfo.value.markdown_report)
+  store.pushToast(
+    ok ? '已复制脱敏诊断报告（Markdown），可直接粘贴到 GitHub Issue' : '复制失败，请展开下方预览手动复制',
+    ok ? 'success' : 'error',
+  )
+}
+
+const diagnosticBundleUrl = computed(() =>
+  mailApi.getDiagnosticBundleUrl(diagnosticsInfo.value?.event_id),
+)
+
+const secretModeLabel = computed(() => {
+  const mode = diagnosticsInfo.value?.secret_key_mode
+  if (mode === 'env') return '环境变量 (MAILHUB_SECRET_KEY)'
+  if (mode === 'file') return '本地密钥文件 (data/.secret.key)'
+  return '尚未初始化'
+})
+
 async function handleClearCache(): Promise<void> {
   const res = await mailApi.clearCache()
   await loadStorage()
@@ -484,6 +560,8 @@ watch(
       oauthDraft.msId = store.settings.oauth_microsoft_client_id
       if (tab === 'privacy') {
         void loadStorage()
+      } else if (tab === 'diagnostics') {
+        void loadDiagnostics()
       }
     } else {
       stopOAuthPoll()
@@ -1189,6 +1267,125 @@ onUnmounted(() => {
               </div>
             </div>
           </div>
+
+          <!-- TAB 6: 关于与诊断 -->
+          <div v-else-if="store.settingsTab === 'diagnostics'" class="tab-section">
+            <div class="panel-card">
+              <div class="card-heading">
+                <span>关于 MailHub 与运行环境</span>
+                <span class="mini-tag auth">
+                  v{{ diagnosticsInfo?.app_version ?? '1.1.0' }}
+                  <template v-if="diagnosticsInfo?.git_commit"> · {{ diagnosticsInfo.git_commit }}</template>
+                </span>
+              </div>
+
+              <div v-if="diagnosticsError" class="status-banner err">{{ diagnosticsError }}</div>
+
+              <div v-if="diagnosticsInfo" class="diag-meta-grid">
+                <div class="stat-box">
+                  <span>操作系统 / 架构</span>
+                  <strong class="diag-small-val">{{ diagnosticsInfo.os_info }} ({{ diagnosticsInfo.arch }})</strong>
+                </div>
+                <div class="stat-box">
+                  <span>Python / 本地端口</span>
+                  <strong class="diag-small-val">{{ diagnosticsInfo.python_version }} · {{ diagnosticsInfo.host }}:{{ diagnosticsInfo.port }}</strong>
+                </div>
+                <div class="stat-box">
+                  <span>主密钥来源</span>
+                  <strong class="diag-small-val">{{ secretModeLabel }}</strong>
+                </div>
+                <div class="stat-box">
+                  <span>前端静态产物</span>
+                  <strong class="diag-small-val">{{ diagnosticsInfo.frontend_dist_ready ? '已就绪 (frontend/dist)' : '未构建（开发代理模式）' }}</strong>
+                </div>
+              </div>
+
+              <div class="privacy-actions" style="margin-top: 12px">
+                <a class="btn-primary link-as-btn" :href="GITHUB_ISSUES_URL" target="_blank" rel="noopener noreferrer">
+                  <Bug :size="14" />
+                  <span>前往 GitHub 提交 Issue</span>
+                  <ExternalLink :size="12" />
+                </a>
+                <a class="btn-outline link-as-btn" :href="GITHUB_FAQ_URL" target="_blank" rel="noopener noreferrer">
+                  <span>查看 README 常见问题</span>
+                  <ExternalLink :size="12" />
+                </a>
+                <a class="btn-outline link-as-btn" :href="GITHUB_PROVIDER_GUIDE_URL" target="_blank" rel="noopener noreferrer">
+                  <span>邮箱渠道与 OAuth2 指南</span>
+                  <ExternalLink :size="12" />
+                </a>
+                <a class="btn-outline link-as-btn" :href="GITHUB_REPO_URL" target="_blank" rel="noopener noreferrer">
+                  <span>项目主页</span>
+                  <ExternalLink :size="12" />
+                </a>
+              </div>
+            </div>
+
+            <div class="panel-card">
+              <div class="card-heading">
+                <span>Issue 精准排障 · 脱敏诊断报告与诊断包</span>
+                <button
+                  type="button"
+                  class="btn-outline"
+                  :disabled="loadingDiagnostics"
+                  @click="loadDiagnostics"
+                >
+                  <RefreshCw :size="13" :class="{ spinning: loadingDiagnostics }" />
+                  <span>{{ loadingDiagnostics ? '采集中…' : '刷新快照' }}</span>
+                </button>
+              </div>
+
+              <div class="guide-tip">
+                <span>
+                  诊断报告与诊断包采用尽力脱敏：自动遮罩邮箱前缀、用户主目录路径、主机名、Fernet 密文与 OAuth/授权码凭据，且<strong>绝不包含邮件正文或数据库文件</strong>。分享至公开 Issue 前仍请展开预览自行复核。
+                </span>
+              </div>
+
+              <div v-if="diagnosticsInfo" class="diag-event-bar">
+                <div>
+                  <span class="diag-event-label">本次诊断 Event ID：</span>
+                  <code class="diag-event-code">{{ diagnosticsInfo.event_id }}</code>
+                </div>
+                <span class="diag-log-stats">
+                  同步记录 {{ diagnosticsInfo.recent_sync_logs.length }} 条 · 后端日志 {{ diagnosticsInfo.backend_log_lines.length }} 行 · 启动器日志 {{ diagnosticsInfo.launcher_log_lines.length }} 行
+                </span>
+              </div>
+
+              <div class="privacy-actions">
+                <button
+                  type="button"
+                  class="btn-outline"
+                  :disabled="!diagnosticsInfo"
+                  @click="handleCopyEventId"
+                >
+                  <Copy :size="14" />
+                  <span>复制 Event ID</span>
+                </button>
+                <button
+                  type="button"
+                  class="btn-primary"
+                  :disabled="!diagnosticsInfo"
+                  @click="handleCopyDiagnosticReport"
+                >
+                  <Copy :size="14" />
+                  <span>复制脱敏诊断报告 (Markdown)</span>
+                </button>
+                <a
+                  class="btn-outline link-as-btn"
+                  :href="diagnosticBundleUrl"
+                  download
+                >
+                  <HardDriveDownload :size="14" />
+                  <span>导出脱敏诊断包 (.zip)</span>
+                </a>
+              </div>
+
+              <details v-if="diagnosticsInfo" class="diag-preview-details">
+                <summary>展开预览将要复制的脱敏 Markdown 诊断报告（建议分享前检查）</summary>
+                <pre class="diag-preview-pre soft-scroll">{{ diagnosticsInfo.markdown_report }}</pre>
+              </details>
+            </div>
+          </div>
         </div>
       </div>
     </motion.div>
@@ -1858,5 +2055,70 @@ onUnmounted(() => {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.diag-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+}
+
+.diag-small-val {
+  font-size: 13px !important;
+  word-break: break-word;
+}
+
+.diag-event-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 9px 12px;
+  margin-bottom: 12px;
+  border-radius: 10px;
+  background: var(--letter-card-bg);
+  font-size: 12px;
+}
+
+.diag-event-label {
+  color: var(--text-secondary);
+}
+
+.diag-event-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 700;
+  color: var(--accent-text);
+}
+
+.diag-log-stats {
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.diag-preview-details {
+  margin-top: 12px;
+}
+
+.diag-preview-details summary {
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.diag-preview-pre {
+  margin: 10px 0 0;
+  padding: 12px;
+  max-height: 240px;
+  overflow: auto;
+  border-radius: 10px;
+  border: 1px solid var(--divider);
+  background: var(--letter-card-bg);
+  color: var(--text-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 </style>

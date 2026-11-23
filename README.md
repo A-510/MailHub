@@ -4,6 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/A-510/MailHub/releases"><img src="https://img.shields.io/badge/Release-MailHubLauncher.exe-E7749B?style=flat-square" alt="下载 Windows 启动器"></a>
+  <a href="https://github.com/A-510/MailHub/issues"><img src="https://img.shields.io/badge/Issues-Bug%20%7C%20Feature%20%7C%20Q%26A-F08DB8?style=flat-square" alt="GitHub Issues 模板反馈"></a>
   <img src="https://img.shields.io/badge/Frontend-Vue%203%20%2B%20TypeScript-8C6BE8?style=flat-square" alt="Vue 3 与 TypeScript">
   <img src="https://img.shields.io/badge/Backend-FastAPI%20%2B%20SQLite%20FTS5-2E8B57?style=flat-square" alt="FastAPI 与 SQLite FTS5">
   <img src="https://img.shields.io/badge/Security-Fernet%20%2B%20OAuth2%20PKCE-6E4FD4?style=flat-square" alt="Fernet 本地加密与 OAuth2 PKCE">
@@ -25,7 +26,10 @@
 - [键盘快捷键](#键盘快捷键)
 - [目录结构](#目录结构)
 - [无图降级与自定义视觉扩展](#无图降级与自定义视觉扩展)
+- [常见问题](#常见问题)
+- [问题反馈与参与贡献](#问题反馈与参与贡献)
 - [开发与测试](#开发与测试)
+- [环境变量说明（可选）](#环境变量说明可选)
 
 ---
 
@@ -40,6 +44,7 @@
   - SMTP 发信支持 **465 (SSL) → 587 (STARTTLS)** 自动回退、非 ASCII 主机名自动转码安全 `local_hostname` 以及延迟撤销发送（默认 5 秒可调）。
 - **FTS5 秒级全文检索与智能分类**：基于 SQLite `emails_fts` 虚拟表实时索引邮件主题、发件人、摘要与正文；支持自定义分类规则（发件人/主题匹配至工作、学习、社交、订阅）。
 - **开箱即用演示沙盒**：首次启动自动载入 5 个示例账号与精选测试邮件；随时可在「设置中心」一键重置或清空演示数据，不影响已绑定的真实邮箱。
+- **精准排障与脱敏诊断**：内置「设置中心 → 关于与诊断」面板，支持查看版本与运行环境、生成诊断 `Event ID`、一键复制脱敏 Markdown 诊断报告或导出 `.zip` 诊断包（自动遮罩邮箱前缀、用户路径、主机名与凭据），助力快速定位与修复 Issue。
 
 ---
 
@@ -133,6 +138,8 @@ MailHub 采用 **OAuth2 Authorization Code + PKCE (S256)** 与本地回环回调
 2. 打开 MailHub 右上角 **设置中心 → 邮箱渠道 → OAuth2 客户端配置**，填入你自己的 `Client ID`（Google 桌面/Web 客户端按需填写 `Client Secret`）。
 3. 返回添加邮箱页点击**「跳转浏览器 OAuth2 登录」**，授权完成后令牌将加密写入本机 `data/mailhub.db`。
 
+> 📘 **完整配置手册**：各服务商授权码开启入口、Google 测试用户配置、Microsoft Entra 权限清单及错误码对照，请参阅 [**邮箱渠道与 OAuth2 配置指南**](docs/guide/email-providers-and-oauth2.md)。
+
 ---
 
 ## 隐私与安全设计
@@ -162,23 +169,25 @@ MailHub 采用 **OAuth2 Authorization Code + PKCE (S256)** 与本地回环回调
 
 ```text
 MailHub/
+├── .github/ISSUE_TEMPLATE/        # GitHub Issue 模板（Bug 反馈 / 新功能支持 / 使用问题咨询）
 ├── assets/readme/                 # README 纯矢量 SVG 图示（无位图依赖）
+├── docs/guide/                    # 邮箱渠道与 OAuth2 PKCE 详细配置与排障指南
 ├── backend/
 │   ├── app/
 │   │   ├── api/                   # FastAPI 路由层（accounts / emails / oauth / settings_rules）
-│   │   ├── core/                  # 全局配置（pydantic-settings）、SQLite WAL & FTS5 初始化、日志
+│   │   ├── core/                  # 全局配置（pydantic-settings）、SQLite WAL & FTS5、文件轮转日志
 │   │   ├── model/                 # SQLAlchemy 2.0 ORM 模型（Account / Email / Attachment 等）
 │   │   ├── repository/            # 数据库访问层（含 FTS5 检索与分页计数）
 │   │   ├── schema/                # Pydantic v2 请求与响应校验模型
-│   │   └── service/               # 业务逻辑（IMAP/SMTP、OAuth2 PKCE、Fernet 加密、定时调度、演示数据）
-│   ├── tests/                     # 后端集成与协议测试套件
+│   │   └── service/               # 业务逻辑（IMAP/SMTP、OAuth2 PKCE、Fernet 加密、脱敏诊断导出等）
+│   ├── tests/                     # 后端集成、协议与脱敏诊断测试套件
 │   └── requirements.txt
 ├── frontend/
 │   ├── public/vendor/             # Live2D Cubism Core 运行时（仅作用于本地可选模型加载）
 │   ├── scripts/                   # 本地素材切图工具脚本
 │   ├── src/
 │   │   ├── api/                   # 前端 HTTP 请求封装
-│   │   ├── components/            # 书房四栏 UI 组件、设置中心、向导与可选立绘槽位
+│   │   ├── components/            # 书房四栏 UI 组件、设置中心（含关于与诊断）、向导与可选立绘槽位
 │   │   ├── composables/           # 主题切换、3D 动效、HTML 安全清洗、向导定位逻辑
 │   │   ├── stores/                # Pinia 全局状态与撤销发送队列
 │   │   ├── styles/                # Sakura / Starlight 色彩令牌与 3D 书页样式
@@ -195,9 +204,10 @@ MailHub/
 │   ├── MailHubLauncher.spec       # PyInstaller 单文件打包配置
 │   ├── build_exe.ps1              # 一键构建脚本
 │   └── tests/                     # 启动器核心逻辑单元测试
+├── CONTRIBUTING.md                # Issue 提交规范与代码贡献指南
 ├── launcher.py                    # 命令行轻量启动回退入口
 ├── 启动MailHub.bat                # Windows 批处理启动脚本
-├── .gitignore                     # 排除运行时数据、密钥、构建缓存、可执行包与原始图片素材
+├── .gitignore                     # 排除运行时数据、密钥、构建缓存、可执行包、参考草稿与原始素材
 └── README.md
 ```
 
@@ -213,10 +223,89 @@ MailHub/
 
 ---
 
+## 常见问题
+
+<details>
+<summary><strong>1. QQ / 163 / 126 / Gmail 使用网页登录密码一直提示认证失败？</strong></summary>
+
+这些服务商通常不允许第三方桌面客户端直接使用邮箱网页登录密码：
+- **QQ / Foxmail**：需在网页版 **设置 → 账户** 开启 IMAP/SMTP 后生成 **16 位授权码**；
+- **网易 163 / 126 / yeah.net**：需在网页版 **设置 → POP3/SMTP/IMAP** 开启服务并创建 **客户端授权密码**（MailHub 会自动发送 RFC 2971 IMAP ID 避免 `Unsafe Login` 拦截）；
+- **Gmail**：需开启 Google 账号两步验证后生成 **16 位应用专用密码**（带空格直接粘贴即可，后端会自动去空格），或改用浏览器 OAuth2 登录。
+
+详细步骤与常见报错对照见 [**邮箱渠道与 OAuth2 配置指南**](docs/guide/email-providers-and-oauth2.md)。
+
+</details>
+
+<details>
+<summary><strong>2. Microsoft Outlook / Hotmail 为什么不能填密码直接登录？</strong></summary>
+
+微软已针对个人 Outlook / Hotmail 账户全面停用基础密码登录（Basic Auth）。请在添加邮箱时切换到右上角的 **「跳转浏览器登录」**，在设置中心配置好自己的 `Microsoft Entra Client ID`（回调地址填写 `http://127.0.0.1:8765/api/v1/oauth/callback`）后通过 OAuth2 PKCE 授权接入。
+
+</details>
+
+<details>
+<summary><strong>3. 发信或测试连接时提示 TLS/SSL 握手中断（如 465 端口）或超时怎么办？</strong></summary>
+
+本机代理工具或校园网/企业防火墙有时会拦截 SMTPS `465` 端口。MailHub 内置自动回退策略：当 `465 (SSL)` 握手失败且非密码错误时，会自动尝试 `587 (STARTTLS)`（网易 `163/126/yeah.net` 会额外尝试 `994` SSL）。你也可以在添加账号时点击 **「展开自定义 IMAP / SMTP 服务器参数」** 手动切换端口与 SSL 开关。
+
+</details>
+
+<details>
+<summary><strong>4. 桌面启动器提示端口 8765 被占用或无法自动构建前端？</strong></summary>
+
+- **端口冲突**：说明本机已有其他服务或上次异常残留的进程占用了 `8765`，可关闭占用进程，或通过环境变量 `MAILHUB_PORT` 指定其他端口；
+- **前端自动构建失败**：当仓库中尚未生成 `frontend/dist/` 时，启动器会调用本机 `npm` 自动执行 `npm install && npm run build`，请确保系统已安装 Node.js（含 npm）并可在终端运行 `npm --version`；
+- **查看完整启动日志**：启动器运行日志保存在本机 `data/launcher.log`，后端运行日志保存在 `data/backend.log`。
+
+</details>
+
+<details>
+<summary><strong>5. 首次启动为什么自带 5 个示例邮箱？清理演示数据会影响我自己的邮箱吗？</strong></summary>
+
+为了让你克隆即体验四栏书籍手账、搜索、分类规则与附件下载，MailHub 首次检测到空库时会自动注入 5 个演示账号。所有演示账号均带有 `is_demo` 标记，前往 **设置中心 → 隐私与数据 → 清空演示邮箱数据** 只会清理演示数据，**不会删除你绑定的真实邮箱**；随时也可以点击 **重新生成演示数据** 恢复体验环境。
+
+</details>
+
+<details>
+<summary><strong>6. 为什么画面里没有显示背景壁纸、人物立绘或 Live2D 看板娘？</strong></summary>
+
+本开源仓库为了保持体积轻量化与版权合规，默认不附带商业插画与 Live2D 模型。缺少外部资源时前端会自动降级为纯 CSS 书房渐变，不影响任何收发功能；你可在 **设置中心 → 外观与氛围** 中直接上传自己的 `PNG / WEBP / JPG` 立绘图片。
+
+</details>
+
+<details>
+<summary><strong>7. 遇到 Bug 时如何快速提交精准、安全的诊断信息？</strong></summary>
+
+请打开右上角 **设置中心 → 关于与诊断**：
+1. 点击 **「刷新快照」** 生成本次诊断 `Event ID`；
+2. 点击 **「复制脱敏诊断报告 (Markdown)」** 或 **「导出脱敏诊断包 (.zip)」**；
+3. 展开预览框确认其中已自动遮罩邮箱前缀、本地用户路径、主机名与凭据（绝不包含数据库与邮件正文），然后前往 [**Issues 页面**](https://github.com/A-510/MailHub/issues/new/choose) 选择 **Bug 反馈** 模板提交。
+
+</details>
+
+---
+
+## 问题反馈与参与贡献
+
+为了让维护者能够快速复现问题并给出精准修复，本仓库已配置标准 GitHub Issue 模板与配套说明文档：
+
+| 入口 / 文档 | 适用场景 | 链接 |
+| :--- | :--- | :--- |
+| **Bug 反馈 (`[BUG]`)** | 启动器报错、界面异常、收发同步失败或加密/搜索缺陷 | [提交 Bug 反馈](https://github.com/A-510/MailHub/issues/new?template=bug_report.md) |
+| **新功能支持 (`[功能]`)** | 期望新增协议兼容、交互功能、快捷键或设置选项 | [提交功能建议](https://github.com/A-510/MailHub/issues/new?template=feature_request.md) |
+| **使用问题咨询 (`[问题]`)** | 授权码获取、OAuth2 回调设置、自建邮局或环境配置疑问 | [提交使用咨询](https://github.com/A-510/MailHub/issues/new?template=question.md) |
+| **邮箱配置深度指南** | 各渠道授权步骤、OAuth2 控制台设置与常见错误排查 | [docs/guide/email-providers-and-oauth2.md](docs/guide/email-providers-and-oauth2.md) |
+| **贡献与协作规范** | 提交 Issue 前自检、脱敏诊断流程与 PR 开发规范 | [CONTRIBUTING.md](CONTRIBUTING.md) |
+
+> 🔐 **提交 Issue 前请先脱敏**：优先使用客户端 **「设置中心 → 关于与诊断」** 生成的脱敏 Markdown 报告或 `.zip` 诊断包；分享截图与终端日志前，请务必隐藏个人完整邮箱、授权码、`Client Secret` 与 `data/.secret.key`。
+
+---
+
 ## 开发与测试
 
 ```bash
-# 1. 运行后端全量测试（包含 API、SQLite FTS5、加密存储、IMAP/SMTP 兼容与 OAuth2 PKCE）
+# 1. 运行后端全量测试（包含 API、SQLite FTS5、加密存储、IMAP/SMTP 兼容、OAuth2 PKCE 与脱敏诊断导出）
 cd backend
 .\.venv\Scripts\python.exe -m pytest tests/test_mailhub.py -v
 

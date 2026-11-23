@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "MailHub"
+    app_version: str = "1.1.0"
     host: str = "127.0.0.1"
     port: int = 8765
     secret_key: str | None = None
@@ -60,6 +61,16 @@ class Settings(BaseSettings):
     def frontend_dist_dir(self) -> Path:
         """返回构建后的前端静态资源目录。"""
         return self.project_root / "frontend" / "dist"
+
+    @property
+    def backend_log_path(self) -> Path:
+        """返回后端运行日志文件路径。"""
+        return self.data_dir / "backend.log"
+
+    @property
+    def launcher_log_path(self) -> Path:
+        """返回桌面启动器运行日志文件路径。"""
+        return self.data_dir / "launcher.log"
 
 
 settings = Settings()
