@@ -1,0 +1,205 @@
+/* 书籍质感、3D 翻页舞台、航空信纸边框与自定义滚动条 */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  font-family: var(--font-sans);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+textarea,
+select {
+  font-family: inherit;
+}
+
+/* 书本 3D 透视外壳 */
+.book-shell {
+  position: relative;
+  z-index: 3;
+  border-radius: 22px;
+  padding: 10px 12px 14px;
+  background: var(--book-cover);
+  border: 1.5px solid var(--book-cover-border);
+  box-shadow: var(--book-outer-shadow);
+  perspective: 1800px;
+}
+
+/* 书本底侧厚纸页叠层视觉 */
+.book-shell::before,
+.book-shell::after {
+  content: '';
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: 4px;
+  height: 8px;
+  border-radius: 0 0 14px 14px;
+  background: var(--page-edge-stack);
+  border-bottom: 1px solid var(--page-border);
+  pointer-events: none;
+}
+
+.book-shell::after {
+  bottom: 8px;
+  left: 18px;
+  right: 18px;
+  opacity: 0.72;
+}
+
+.book-pages-stage {
+  position: relative;
+  display: grid;
+  grid-template-columns: 0.94fr 1.06fr;
+  width: 100%;
+  height: 100%;
+  border-radius: 15px;
+  overflow: hidden;
+  border: 1px solid var(--page-border);
+  transform-style: preserve-3d;
+}
+
+.book-page-left {
+  position: relative;
+  background: var(--page-left-bg);
+  border-right: 1px solid var(--divider);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.book-page-right {
+  position: relative;
+  background: var(--page-right-bg);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* 中央书脊弧度高光与折痕阴影 */
+.book-spine-crease {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(47% - 22px);
+  width: 44px;
+  pointer-events: none;
+  z-index: 6;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--spine-shadow) 42%,
+    rgba(255, 255, 255, 0.35) 50%,
+    var(--spine-shadow) 58%,
+    transparent 100%
+  );
+  opacity: 0.72;
+}
+
+/* 3D 翻页临时视觉代理层（不复制焦点，aria-hidden） */
+.book-flip-proxy {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 53%;
+  right: 0;
+  transform-origin: left center;
+  transform-style: preserve-3d;
+  pointer-events: none;
+  z-index: 25;
+}
+
+.book-flip-proxy.flip-backward {
+  left: 0;
+  right: auto;
+  width: 47%;
+  transform-origin: right center;
+}
+
+.book-flip-face {
+  position: absolute;
+  inset: 0;
+  backface-visibility: hidden;
+  border-radius: 0 14px 14px 0;
+  background: var(--page-right-bg);
+  border: 1px solid var(--page-border);
+  box-shadow: -12px 0 36px rgba(64, 42, 86, 0.22), inset 14px 0 28px rgba(120, 84, 148, 0.12);
+}
+
+.book-flip-face.back {
+  transform: rotateY(180deg);
+  border-radius: 14px 0 0 14px;
+  background: var(--page-left-bg);
+  box-shadow: 12px 0 36px rgba(64, 42, 86, 0.2), inset -14px 0 28px rgba(120, 84, 148, 0.12);
+}
+
+/* 航空信封红蓝斜纹边框细节 */
+.airmail-stripe {
+  height: 4px;
+  width: 100%;
+  background: repeating-linear-gradient(
+    -45deg,
+    #ec7ca8 0px,
+    #ec7ca8 10px,
+    transparent 10px,
+    transparent 16px,
+    #889ef5 16px,
+    #889ef5 26px,
+    transparent 26px,
+    transparent 32px
+  );
+  opacity: 0.7;
+}
+
+/* 契合明暗主题的丝带风格自定义滚动条（全局禁止声明 scrollbar-width 以免屏蔽 WebKit 样式） */
+.soft-scroll {
+  overflow-y: auto;
+}
+
+.soft-scroll::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.soft-scroll::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.soft-scroll::-webkit-scrollbar-track {
+  margin: 4px 0;
+  border-radius: 999px;
+  background: var(--scrollbar-track);
+}
+
+.soft-scroll::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: var(--scrollbar-thumb);
+  border: 1.5px solid transparent;
+  background-clip: content-box;
+  transition: background 0.2s ease;
+}
+
+.soft-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  border: 1px solid transparent;
+  background-clip: content-box;
+}
+
+.soft-scroll::-webkit-scrollbar-corner {
+  background: transparent;
+}

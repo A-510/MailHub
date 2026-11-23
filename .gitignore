@@ -1,0 +1,41 @@
+# Python & 测试缓存
+__pycache__/
+*.py[cod]
+backend/.venv/
+.pytest_cache/
+
+# Node & 前端构建产物
+frontend/node_modules/
+frontend/dist/
+
+# 启动器打包产物与临时构建目录（exe 发布在 GitHub Release）
+launcher_app/build/
+MailHubLauncher.exe
+
+# 运行时个人数据、邮箱数据库、密钥与日志（严禁提交）
+data/
+.env
+.env.*
+*.db
+*.db-shm
+*.db-wal
+*.key
+*.log
+
+# 原始素材、图片、立绘、Live2D 模型与内部设计稿（不随源码仓库上传）
+素材/
+界面框架图.png
+live2d/
+.design-pipeline/
+frontend/src/assets/
+launcher_app/assets/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.gif
+*.ico
+*.bmp
+*.psd
+*.cmo3
+*.moc3

@@ -1,0 +1,116 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="270" viewBox="0 0 1200 270"
+     role="img" aria-labelledby="title desc">
+  <title id="title">MailHub 四步快速上手流程</title>
+  <desc id="desc">展示从 GitHub Release 下载启动器、自动检测与安装依赖、绑定个人邮箱到开启多邮箱聚合阅读的四步工作流。</desc>
+
+  <defs>
+    <linearGradient id="wfBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1E162E" />
+      <stop offset="100%" stop-color="#271D3C" />
+    </linearGradient>
+    <marker id="wfArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#F08DB8" />
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="270" rx="24" fill="url(#wfBg)" />
+  <rect x="1" y="1" width="1198" height="268" rx="23" fill="none" stroke="#4D3A6D" stroke-width="2" />
+
+  <text x="48" y="54"
+        font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+        font-size="28" font-weight="700" fill="#FFF8FC">四步快速开启樱花书房</text>
+  <text x="382" y="53"
+        font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+        font-size="18" fill="#C4B5DF">首次自动注入演示邮箱，体验满意后随时一键清空并绑定真实账号</text>
+
+  <!-- Step 1 -->
+  <g transform="translate(48 82)">
+    <rect x="0" y="0" width="256" height="152" rx="16" fill="#2A2042" stroke="#6E55A0" stroke-width="1.5" />
+    <rect x="18" y="16" width="54" height="28" rx="14" fill="#E7749B" />
+    <text x="45" y="36" text-anchor="middle"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="18" font-weight="700" fill="#FFFFFF">01</text>
+    <text x="84" y="36"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="20" font-weight="700" fill="#FFF8FC">获取启动器</text>
+    <text x="18" y="80"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#DDD2EF">从 Release 下载</text>
+    <text x="18" y="108"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="18" font-weight="600" fill="#FFB3D4">MailHubLauncher.exe</text>
+    <text x="18" y="136"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#BFAFD9">放入仓库根目录双击</text>
+  </g>
+
+  <line x1="307" y1="158" x2="323" y2="158" stroke="#F08DB8" stroke-width="2.5" marker-end="url(#wfArrow)" />
+
+  <!-- Step 2 -->
+  <g transform="translate(330 82)">
+    <rect x="0" y="0" width="256" height="152" rx="16" fill="#2A2042" stroke="#6E55A0" stroke-width="1.5" />
+    <rect x="18" y="16" width="54" height="28" rx="14" fill="#8C6BE8" />
+    <text x="45" y="36" text-anchor="middle"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="18" font-weight="700" fill="#FFFFFF">02</text>
+    <text x="84" y="36"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="20" font-weight="700" fill="#FFF8FC">环境自检拉起</text>
+    <text x="18" y="80"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#DDD2EF">自动检测 Python / 依赖</text>
+    <text x="18" y="108"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#DDD2EF">启动 8765 端口服务</text>
+    <text x="18" y="136"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#BFAFD9">最小化托盘后台守护</text>
+  </g>
+
+  <line x1="589" y1="158" x2="605" y2="158" stroke="#F08DB8" stroke-width="2.5" marker-end="url(#wfArrow)" />
+
+  <!-- Step 3 -->
+  <g transform="translate(612 82)">
+    <rect x="0" y="0" width="256" height="152" rx="16" fill="#2A2042" stroke="#6E55A0" stroke-width="1.5" />
+    <rect x="18" y="16" width="54" height="28" rx="14" fill="#E7749B" />
+    <text x="45" y="36" text-anchor="middle"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="18" font-weight="700" fill="#FFFFFF">03</text>
+    <text x="84" y="36"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="20" font-weight="700" fill="#FFF8FC">接入真实邮箱</text>
+    <text x="18" y="80"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#DDD2EF">点击右侧 + 添加渠道</text>
+    <text x="18" y="108"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#DDD2EF">8 大服务商自动补全</text>
+    <text x="18" y="136"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#BFAFD9">支持授权码 / OAuth2</text>
+  </g>
+
+  <line x1="871" y1="158" x2="887" y2="158" stroke="#F08DB8" stroke-width="2.5" marker-end="url(#wfArrow)" />
+
+  <!-- Step 4 -->
+  <g transform="translate(894 82)">
+    <rect x="0" y="0" width="256" height="152" rx="16" fill="#2A2042" stroke="#34D399" stroke-width="1.5" />
+    <rect x="18" y="16" width="54" height="28" rx="14" fill="#2E8B57" />
+    <text x="45" y="36" text-anchor="middle"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="18" font-weight="700" fill="#FFFFFF">04</text>
+    <text x="84" y="36"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="20" font-weight="700" fill="#FFF8FC">书房聚合收发</text>
+    <text x="18" y="80"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#DDD2EF">勾选聚合多箱未读</text>
+    <text x="18" y="108"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#DDD2EF">FTS5 秒级全文检索</text>
+    <text x="18" y="136"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#BFAFD9">智能分类 &amp; 5s 撤回</text>
+  </g>
+</svg>

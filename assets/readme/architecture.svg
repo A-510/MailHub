@@ -1,0 +1,143 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="504" viewBox="0 0 1200 504"
+     role="img" aria-labelledby="title desc">
+  <title id="title">MailHub 系统架构与本地数据隔离</title>
+  <desc id="desc">展示 MailHub 启动器进程守护、Vue 3 书房前端、FastAPI 分层后端以及 SQLite FTS5 与 Fernet 本地加密数据区之间的协作关系。</desc>
+
+  <defs>
+    <linearGradient id="archBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1D152C" />
+      <stop offset="100%" stop-color="#271D3D" />
+    </linearGradient>
+    <marker id="arrowViolet" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#C4AEFF" />
+    </marker>
+    <marker id="arrowMint" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#5EEAD4" />
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="504" rx="24" fill="url(#archBg)" />
+  <rect x="1" y="1" width="1198" height="502" rx="23" fill="none" stroke="#4D3A6D" stroke-width="2" />
+
+  <!-- 顶部标题栏 -->
+  <text x="48" y="56"
+        font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+        font-size="30" font-weight="700" fill="#FFF8FC">系统架构与本地隐私边界</text>
+  <rect x="814" y="28" width="338" height="38" rx="19" fill="#2A2044" stroke="#34D399" stroke-width="1.4" />
+  <circle cx="836" cy="47" r="5" fill="#34D399" />
+  <text x="850" y="53"
+        font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+        font-size="18" font-weight="600" fill="#B6F4DE">纯本地环回服务 · 凭据密文落盘</text>
+
+  <!-- 节点 1：PyQt6 桌面启动器 -->
+  <g transform="translate(48 92)">
+    <rect x="0" y="0" width="332" height="214" rx="16" fill="#2A2042" stroke="#E7749B" stroke-width="1.8" />
+    <rect x="18" y="18" width="126" height="28" rx="14" fill="#4B284B" />
+    <text x="81" y="38" text-anchor="middle"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="18" font-weight="700" fill="#FFB3D4">LAUNCHER</text>
+    <text x="18" y="76"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="22" font-weight="700" fill="#FFF8FC">MailHubLauncher.exe</text>
+    <text x="18" y="110"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#D5C8EB">· PyQt6 无边框樱花桌面窗口</text>
+    <text x="18" y="138"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#D5C8EB">· Python / .venv / 依赖自检</text>
+    <text x="18" y="166"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#D5C8EB">· Windows Job Object 守护</text>
+    <text x="18" y="192"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#BFAFD9">· 最小化系统托盘防误关</text>
+  </g>
+
+  <!-- 节点 2：Vue 3 前端 -->
+  <g transform="translate(434 92)">
+    <rect x="0" y="0" width="332" height="214" rx="16" fill="#2A2042" stroke="#9A7DF4" stroke-width="1.8" />
+    <rect x="18" y="18" width="130" height="28" rx="14" fill="#3A2C63" />
+    <text x="83" y="38" text-anchor="middle"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="18" font-weight="700" fill="#D9C9FF">FRONTEND</text>
+    <text x="18" y="76"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="22" font-weight="700" fill="#FFF8FC">Vue 3 + TS 书房界面</text>
+    <text x="18" y="110"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#D5C8EB">· 四栏立体书页 &amp; motion-v 翻页</text>
+    <text x="18" y="138"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#D5C8EB">· DOMPurify 净化 &amp; 外链图拦截</text>
+    <text x="18" y="166"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#D5C8EB">· 明亮樱花 / 暗黑星夜双主题</text>
+    <text x="18" y="192"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#BFAFD9">· Pinia 状态 &amp; 延迟撤销发送</text>
+  </g>
+
+  <!-- 节点 3：FastAPI 后端 -->
+  <g transform="translate(820 92)">
+    <rect x="0" y="0" width="332" height="214" rx="16" fill="#2A2042" stroke="#8C6BE8" stroke-width="1.8" />
+    <rect x="18" y="18" width="144" height="28" rx="14" fill="#3A2C63" />
+    <text x="90" y="38" text-anchor="middle"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="18" font-weight="700" fill="#D9C9FF">FASTAPI API</text>
+    <text x="18" y="76"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="22" font-weight="700" fill="#FFF8FC">127.0.0.1:8765 后端</text>
+    <text x="18" y="110"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#D5C8EB">· api → service → repository</text>
+    <text x="18" y="138"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#D5C8EB">· IMAP (RFC 6154 / 2971) 同步</text>
+    <text x="18" y="166"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#D5C8EB">· aiosmtplib 多端口自动回退</text>
+    <text x="18" y="192"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#BFAFD9">· OAuth2 PKCE + 后台定时轮询</text>
+  </g>
+
+  <!-- 顶层横向连线 -->
+  <line x1="382" y1="199" x2="428" y2="199" stroke="#C4AEFF" stroke-width="2.5" marker-end="url(#arrowViolet)" />
+  <line x1="768" y1="199" x2="814" y2="199" stroke="#C4AEFF" stroke-width="2.5" marker-start="url(#arrowViolet)" marker-end="url(#arrowViolet)" />
+
+  <!-- 后端到底部数据区的垂直连线 -->
+  <line x1="986" y1="308" x2="986" y2="346" stroke="#5EEAD4" stroke-width="2.5" marker-end="url(#arrowMint)" />
+
+  <!-- 底部：本地加密存储隐私区 -->
+  <g transform="translate(48 352)">
+    <rect x="0" y="0" width="1104" height="118" rx="18" fill="#171124" stroke="#34D399" stroke-width="1.6" stroke-dasharray="7 5" />
+    <text x="22" y="32"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="20" font-weight="700" fill="#6EE7B7">本地加密隔离区（data/ 目录受 .gitignore 排除，永不随仓库上传）</text>
+
+    <rect x="22" y="46" width="340" height="56" rx="12" fill="#251C3A" stroke="#4D3D70" stroke-width="1.2" />
+    <text x="38" y="70"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="18" font-weight="700" fill="#FFF8FC">data/mailhub.db</text>
+    <text x="38" y="93"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#C4B5DF">SQLite WAL + FTS5 中英文全文索引</text>
+
+    <rect x="382" y="46" width="340" height="56" rx="12" fill="#251C3A" stroke="#4D3D70" stroke-width="1.2" />
+    <text x="398" y="70"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="18" font-weight="700" fill="#FFF8FC">data/.secret.key</text>
+    <text x="398" y="93"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#C4B5DF">Fernet 对称加密授权码与令牌</text>
+
+    <rect x="742" y="46" width="340" height="56" rx="12" fill="#251C3A" stroke="#4D3D70" stroke-width="1.2" />
+    <text x="758" y="70"
+          font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace"
+          font-size="18" font-weight="700" fill="#FFF8FC">data/attachments &amp; logs</text>
+    <text x="758" y="93"
+          font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei UI', sans-serif"
+          font-size="18" fill="#C4B5DF">本地附件缓存 · 立绘 · 运行日志</text>
+  </g>
+</svg>
