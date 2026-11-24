@@ -1297,7 +1297,7 @@ onUnmounted(() => {
               <div class="card-heading">
                 <span>关于 MailHub 与运行环境</span>
                 <span class="mini-tag auth">
-                  v{{ diagnosticsInfo?.app_version ?? '1.1.0' }}
+                  v{{ diagnosticsInfo?.app_version ?? '1.2.0' }}
                   <template v-if="diagnosticsInfo?.git_commit"> · {{ diagnosticsInfo.git_commit }}</template>
                 </span>
               </div>

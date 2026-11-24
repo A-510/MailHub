@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "MailHub"
-    app_version: str = "1.1.0"
+    app_version: str = "1.2.0"
     host: str = "127.0.0.1"
     port: int = 8765
     secret_key: str | None = None
