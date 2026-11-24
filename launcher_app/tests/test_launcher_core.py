@@ -150,3 +150,19 @@ def test_service_controller_real_spawn_and_clean_stop() -> None:
             break
         time.sleep(0.2)
     assert MailHubServiceController.is_port_open("127.0.0.1", test_port) is False
+
+
+def test_build_browser_url_adds_cache_buster() -> None:
+    """验证启动器打开本地入口时自动追加防缓存时间戳参数，同时保留自带查询参数。"""
+    busted = MailHubServiceController.build_browser_url("http://127.0.0.1:8765")
+    assert busted.startswith("http://127.0.0.1:8765?v=")
+    assert busted.split("?v=", 1)[1].isdigit()
+
+    preserved = MailHubServiceController.build_browser_url("http://127.0.0.1:8765?tour=1")
+    assert preserved == "http://127.0.0.1:8765?tour=1"
+
+    opened_urls: list[str] = []
+    with patch("launcher_app.service_manager.webbrowser.open", side_effect=lambda u: opened_urls.append(u)):
+        MailHubServiceController.open_browser("http://127.0.0.1:8765")
+    assert len(opened_urls) == 1
+    assert opened_urls[0].startswith("http://127.0.0.1:8765?v=")

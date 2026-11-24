@@ -21,6 +21,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "undo_send_seconds": 5,
     "sync_interval_minutes": 5,
     "sync_days": 30,
+    "realtime_push": True,
     "desktop_notifications": True,
     "block_remote_images": False,
     "oauth_google_client_id": "",

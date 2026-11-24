@@ -10,6 +10,7 @@ import type {
   EmailSummary,
   FolderCounts,
   FolderType,
+  MailSyncedEvent,
   ProviderPreset,
   SyncLogItem,
 } from '@/types/mail'
@@ -69,6 +70,7 @@ export const useMailStore = defineStore('mailhub', () => {
     undo_send_seconds: 5,
     sync_interval_minutes: 5,
     sync_days: 30,
+    realtime_push: true,
     desktop_notifications: true,
     block_remote_images: false,
     oauth_google_client_id: '',
@@ -206,8 +208,18 @@ export const useMailStore = defineStore('mailhub', () => {
     accounts.value = await mailApi.listAccounts()
   }
 
-  async function fetchEmails(opts?: { selectFirst?: boolean; keepSelection?: boolean }): Promise<void> {
-    loadingList.value = true
+  // 递增请求序号：防止慢请求乱序返回覆盖最新列表状态
+  let emailFetchSeq = 0
+
+  async function fetchEmails(opts?: {
+    selectFirst?: boolean
+    keepSelection?: boolean
+    silent?: boolean
+  }): Promise<void> {
+    const reqSeq = ++emailFetchSeq
+    if (!opts?.silent) {
+      loadingList.value = true
+    }
     try {
       const res = await mailApi.listEmails({
         folder: activeFolder.value,
@@ -221,6 +233,7 @@ export const useMailStore = defineStore('mailhub', () => {
         page: currentPage.value,
         page_size: pageSize.value,
       })
+      if (reqSeq !== emailFetchSeq) return
       hasInitialFetch.value = true
       emails.value = res.items
       totalEmails.value = res.total
@@ -241,6 +254,14 @@ export const useMailStore = defineStore('mailhub', () => {
       } else if (opts?.keepSelection && currentEmail.value !== null && res.items.length > 0) {
         // 窗口尺寸变化引起分页容量重算时，尽量保持右侧正在阅读的邮件不被意外切走
       } else if (
+        opts?.keepSelection &&
+        selectedEmailId.value === null &&
+        currentEmail.value === null &&
+        res.items.length > 0
+      ) {
+        // 停留在空列表等待新邮件/验证码到达时，自动选中首封并预览（保持未读状态）
+        await selectEmail(res.items[0].id, { skipMarkRead: true })
+      } else if (
         selectedEmailId.value !== null &&
         !res.items.some((m) => m.id === selectedEmailId.value) &&
         res.items.length > 0
@@ -251,7 +272,9 @@ export const useMailStore = defineStore('mailhub', () => {
         currentEmail.value = null
       }
     } finally {
-      loadingList.value = false
+      if (reqSeq === emailFetchSeq) {
+        loadingList.value = false
+      }
     }
   }
 
@@ -529,6 +552,8 @@ export const useMailStore = defineStore('mailhub', () => {
     pushToast('已撤销发送，返回继续编辑', 'info')
   }
 
+  let postSendCheckTimer: number | null = null
+
   async function executeSendNow(payload: {
     accountId: number
     toAddresses: string[]
@@ -561,6 +586,18 @@ export const useMailStore = defineStore('mailhub', () => {
     pushToast('邮件发送成功 ✨', 'success')
     await fetchEmails()
     await refreshAccounts()
+    if (accounts.value.length > 1) {
+      if (postSendCheckTimer !== null) {
+        window.clearTimeout(postSendCheckTimer)
+      }
+      // 多账号模式下发信后短暂唤醒一次全账号收信，兼顾发给自己另一已绑定邮箱时的快速到账
+      postSendCheckTimer = window.setTimeout(() => {
+        postSendCheckTimer = null
+        void mailApi.quickCheckAccounts(null).catch(() => {
+          // 后台轻量唤醒失败时不打断发信体验
+        })
+      }, 2000)
+    }
   }
 
   function openCompose(seed?: typeof composeSeed.value): void {
@@ -571,6 +608,191 @@ export const useMailStore = defineStore('mailhub', () => {
   function openSettings(tab: typeof settingsTab.value = 'accounts'): void {
     settingsTab.value = tab
     settingsOpen.value = true
+  }
+
+  // 实时 SSE 事件流与切回窗口瞬时唤醒状态
+  let realtimeSource: EventSource | null = null
+  let realtimeDebounceTimer: number | null = null
+  let fallbackPollTimer: number | null = null
+  let hasSseConnectedOnce = false
+  let hadSseError = false
+  let lastFocusCheckAt = 0
+  let pendingSyncEvents: MailSyncedEvent[] = []
+  let visibilityHandler: (() => void) | null = null
+  let focusHandler: (() => void) | null = null
+  let unloadHandler: (() => void) | null = null
+
+  async function flushRealtimeSyncEvents(): Promise<void> {
+    const batch = pendingSyncEvents
+    pendingSyncEvents = []
+    const totalFetched = batch.reduce((sum, item) => sum + item.fetched_count, 0)
+    const hasNotifyEnabled = batch.some((item) => item.notify_enabled && item.inbox_fetched_count > 0)
+    const latestEvent = [...batch].reverse().find((item) => item.fetched_count > 0 && item.latest_subject)
+
+    await Promise.all([
+      refreshAccounts(),
+      fetchEmails({ keepSelection: true, silent: true }),
+      mailApi.getNotifications().then((logs) => {
+        notifications.value = logs
+      }),
+    ])
+
+    if (totalFetched > 0) {
+      const toastText = latestEvent
+        ? totalFetched === 1
+          ? `收到新邮件：${latestEvent.latest_subject}`
+          : `收到 ${totalFetched} 封新邮件（最新：${latestEvent.latest_subject}）`
+        : `收到 ${totalFetched} 封新邮件`
+      pushToast(toastText, 'success')
+
+      if (
+        settings.value.desktop_notifications &&
+        hasNotifyEnabled &&
+        typeof Notification !== 'undefined' &&
+        Notification.permission === 'granted' &&
+        document.hidden
+      ) {
+        const title = latestEvent?.latest_sender
+          ? `${latestEvent.latest_sender} 发来新邮件`
+          : 'MailHub 收到新邮件'
+        const body = latestEvent?.latest_subject || `共 ${totalFetched} 封新邮件`
+        const notif = new Notification(title, { body })
+        notif.onclick = () => {
+          window.focus()
+          notif.close()
+        }
+      }
+    }
+  }
+
+  function handleSseConnectedOrReconnected(): void {
+    if (hasSseConnectedOnce && hadSseError) {
+      hadSseError = false
+      void Promise.all([
+        refreshAccounts(),
+        fetchEmails({ keepSelection: true, silent: true }),
+        mailApi.getNotifications().then((logs) => {
+          notifications.value = logs
+        }),
+      ]).catch(() => {})
+    }
+    hasSseConnectedOnce = true
+    hadSseError = false
+  }
+
+  /**
+   * 订阅后端 SSE 实时推送并注册窗口切回/兜底定时刷新，使新邮件与验证码自动秒级出现。
+   */
+  function connectRealtimeEvents(): void {
+    disconnectRealtimeEvents()
+
+    if (typeof EventSource !== 'undefined') {
+      const es = new EventSource(mailApi.getEventsUrl())
+      realtimeSource = es
+
+      es.addEventListener('connected', () => {
+        handleSseConnectedOrReconnected()
+      })
+      es.onopen = () => {
+        handleSseConnectedOrReconnected()
+      }
+      es.onerror = () => {
+        hadSseError = true
+      }
+      es.addEventListener('mail_synced', (event: MessageEvent<string>) => {
+        try {
+          const parsed = JSON.parse(event.data) as MailSyncedEvent
+          // manual_early 表示手动全量刷新已提前把收件箱新邮件落库，静默刷新列表但不提前弹重复 Toast
+          if (parsed.source !== 'manual' && parsed.source !== 'manual_early') {
+            pendingSyncEvents.push(parsed)
+          }
+        } catch {
+          // 解析异常时仍触发一次静默刷新以保证页面同步
+        }
+        if (realtimeDebounceTimer !== null) {
+          window.clearTimeout(realtimeDebounceTimer)
+        }
+        realtimeDebounceTimer = window.setTimeout(() => {
+          realtimeDebounceTimer = null
+          void flushRealtimeSyncEvents().catch(() => {})
+        }, 40)
+      })
+    }
+
+    const triggerFocusQuickCheck = (): void => {
+      if (document.visibilityState === 'hidden') return
+      if (settings.value.sync_interval_minutes <= 0 || syncing.value) return
+      const now = Date.now()
+      if (now - lastFocusCheckAt < 2500) return
+      lastFocusCheckAt = now
+      void mailApi.quickCheckAccounts(selectedAccountId.value).catch(() => {
+        // 切回窗口瞬时唤醒失败时静默忽略，避免弹窗干扰阅读
+      })
+    }
+
+    visibilityHandler = () => {
+      if (document.visibilityState === 'visible') {
+        triggerFocusQuickCheck()
+      }
+    }
+    focusHandler = () => {
+      triggerFocusQuickCheck()
+    }
+    unloadHandler = () => {
+      disconnectRealtimeEvents()
+    }
+    document.addEventListener('visibilitychange', visibilityHandler)
+    window.addEventListener('focus', focusHandler)
+    window.addEventListener('beforeunload', unloadHandler)
+    window.addEventListener('pagehide', unloadHandler)
+
+    // 兜底定时器：仅当 SSE 未处于 OPEN 连接态时每隔 5s 静默拉取本地 SQLite 最新状态
+    fallbackPollTimer = window.setInterval(() => {
+      if (!realtimeSource || realtimeSource.readyState !== EventSource.OPEN) {
+        void Promise.all([
+          refreshAccounts(),
+          fetchEmails({ keepSelection: true, silent: true }),
+        ]).catch(() => {})
+      }
+    }, 5000)
+  }
+
+  /**
+   * 销毁 SSE 实时推送连接、事件监听与兜底定时器。
+   */
+  function disconnectRealtimeEvents(): void {
+    if (realtimeSource) {
+      realtimeSource.close()
+      realtimeSource = null
+    }
+    if (realtimeDebounceTimer !== null) {
+      window.clearTimeout(realtimeDebounceTimer)
+      realtimeDebounceTimer = null
+    }
+    if (fallbackPollTimer !== null) {
+      window.clearInterval(fallbackPollTimer)
+      fallbackPollTimer = null
+    }
+    if (postSendCheckTimer !== null) {
+      window.clearTimeout(postSendCheckTimer)
+      postSendCheckTimer = null
+    }
+    if (visibilityHandler) {
+      document.removeEventListener('visibilitychange', visibilityHandler)
+      visibilityHandler = null
+    }
+    if (focusHandler) {
+      window.removeEventListener('focus', focusHandler)
+      focusHandler = null
+    }
+    if (unloadHandler) {
+      window.removeEventListener('beforeunload', unloadHandler)
+      window.removeEventListener('pagehide', unloadHandler)
+      unloadHandler = null
+    }
+    pendingSyncEvents = []
+    hasSseConnectedOnce = false
+    hadSseError = false
   }
 
   return {
@@ -637,5 +859,7 @@ export const useMailStore = defineStore('mailhub', () => {
     cancelPendingSend,
     openCompose,
     openSettings,
+    connectRealtimeEvents,
+    disconnectRealtimeEvents,
   }
 })

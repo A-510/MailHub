@@ -86,13 +86,21 @@ def create_app() -> FastAPI:
         if vendor_dir.exists():
             application.mount("/vendor", StaticFiles(directory=str(vendor_dir)), name="frontend-vendor")
 
+        no_cache_html_headers = {
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        }
+
         @application.get("/{full_path:path}", include_in_schema=False)
         def serve_spa(full_path: str) -> FileResponse:
-            """托管前端静态文件并回退至 index.html。"""
+            """托管前端静态文件并回退至 index.html（HTML 禁用浏览器强缓存，确保更新后立即生效）。"""
             candidate: Path = (dist_dir / full_path).resolve()
             if full_path and candidate.is_file() and dist_dir.resolve() in candidate.parents:
+                if candidate.suffix.lower() in (".html", ".htm"):
+                    return FileResponse(str(candidate), headers=no_cache_html_headers)
                 return FileResponse(str(candidate))
-            return FileResponse(str(dist_dir / "index.html"))
+            return FileResponse(str(dist_dir / "index.html"), headers=no_cache_html_headers)
 
         logger.info("Mounted built frontend static assets from %s", dist_dir)
     else:

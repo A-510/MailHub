@@ -33,9 +33,13 @@ class SystemService:
         return AppSettingsOut(**data)
 
     def patch_settings(self, db: Session, payload: AppSettingsPatch) -> AppSettingsOut:
-        """局部更新全局设置。"""
+        """局部更新全局设置，并在同步策略改变时立即唤醒调度器。"""
         updates = payload.model_dump(exclude_unset=True)
         merged = setting_repo.update_many(db, updates)
+        if "sync_interval_minutes" in updates or "realtime_push" in updates:
+            from app.service.scheduler_service import scheduler_service
+
+            scheduler_service.notify_config_changed()
         return AppSettingsOut(**merged)
 
     def save_custom_mascot(self, db: Session, side: str, filename: str, content: bytes) -> AppSettingsOut:

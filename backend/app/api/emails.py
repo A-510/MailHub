@@ -1,6 +1,8 @@
+import asyncio
 import json
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, Response
+from collections.abc import AsyncGenerator
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -12,9 +14,55 @@ from app.schema.schemas import (
     EmailPatchRequest,
 )
 from app.service.email_service import email_service
+from app.service.event_bus import mail_event_bus
 from app.service.system_service import system_service
 
 router = APIRouter(tags=["emails"])
+
+
+@router.get("/events")
+async def stream_mail_events(request: Request) -> StreamingResponse:
+    """
+    Server-Sent Events (SSE) 实时事件流：
+    在后台 IDLE 推送或快速同步入库新邮件/状态变化时立即通知前端刷新。
+    """
+    queue = mail_event_bus.subscribe()
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        try:
+            # 建连后立即输出初始帧，确保前端 EventSource.onopen 与反向代理及时建立流
+            yield 'event: connected\ndata: {"ok": true}\n\n'
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    evt = await asyncio.wait_for(queue.get(), timeout=25.0)
+                except asyncio.TimeoutError:
+                    if await request.is_disconnected():
+                        break
+                    yield ": keepalive\n\n"
+                    continue
+
+                if evt is None:
+                    break
+
+                evt_type = str(evt.get("type", "message"))
+                evt_data = json.dumps(evt.get("data", {}), ensure_ascii=False)
+                yield f"event: {evt_type}\ndata: {evt_data}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            mail_event_bus.unsubscribe(queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/emails", response_model=EmailListResponse)

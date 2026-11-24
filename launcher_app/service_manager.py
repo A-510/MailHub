@@ -703,10 +703,18 @@ class MailHubServiceController:
         self._log_thread.start()
 
     @staticmethod
+    def build_browser_url(url: str = APP_URL) -> str:
+        """为无查询参数的入口 URL 追加时间戳参数，避免浏览器复用旧的 index.html 磁盘缓存。"""
+        if "?" not in url:
+            return f"{url}?v={int(time.time())}"
+        return url
+
+    @staticmethod
     def open_browser(url: str = APP_URL) -> None:
         """使用系统默认浏览器打开 MailHub 网页端。"""
-        logger.info("Opening browser at %s", url)
-        webbrowser.open(url)
+        target_url = MailHubServiceController.build_browser_url(url)
+        logger.info("Opening browser at %s", target_url)
+        webbrowser.open(target_url)
 
     def stop_service(self) -> None:
         """干净关闭由本启动器托管的 uvicorn 服务进程树与 Job Object。"""

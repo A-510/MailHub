@@ -1,6 +1,8 @@
+import asyncio
 import logging
 from sqlalchemy.orm import Session
 
+from app.core.database import SessionLocal
 from app.model.entities import Account
 from app.repository.account_repo import account_repo
 from app.schema.schemas import (
@@ -158,6 +160,9 @@ class AccountService:
         )
         created = account_repo.create(db, acc)
         logger.info("Added new email account id=%s provider=%s", created.id, created.provider)
+        from app.service.scheduler_service import scheduler_service
+
+        scheduler_service.notify_accounts_changed()
         counts_map = account_repo.get_counts_by_account(db)
         return self._to_out(created, counts_map)
 
@@ -168,6 +173,9 @@ class AccountService:
             raise ValueError("未找到指定邮箱账号。")
 
         data = payload.model_dump(exclude_unset=True)
+        connection_fields = {"secret", "imap_host", "imap_port", "imap_ssl", "is_enabled"}
+        needs_restart = bool(connection_fields.intersection(data.keys()))
+
         if "secret" in data:
             secret_val = data.pop("secret")
             if secret_val:
@@ -179,6 +187,11 @@ class AccountService:
             setattr(acc, field, value)
 
         saved = account_repo.save(db, acc)
+        from app.service.scheduler_service import scheduler_service
+
+        scheduler_service.notify_accounts_changed(
+            force_restart_account_id=saved.id if needs_restart else None
+        )
         counts_map = account_repo.get_counts_by_account(db)
         return self._to_out(saved, counts_map)
 
@@ -188,6 +201,10 @@ class AccountService:
         if not acc:
             raise ValueError("未找到指定邮箱账号。")
         account_repo.delete(db, acc)
+        imap_sync_service.clear_account_cache(account_id)
+        from app.service.scheduler_service import scheduler_service
+
+        scheduler_service.notify_accounts_changed()
         logger.info("Deleted email account id=%s", account_id)
 
     def reorder_accounts(self, db: Session, ordered_ids: list[int]) -> list[AccountOut]:
@@ -195,26 +212,64 @@ class AccountService:
         account_repo.reorder(db, ordered_ids)
         return self.list_accounts(db)
 
-    async def sync_all_accounts(self, db: Session) -> dict[str, object]:
-        """调度全部已启用账号执行邮件同步。"""
+    async def sync_all_accounts(
+        self,
+        db: Session,
+        *,
+        inbox_only: bool = False,
+        source: str = "manual",
+    ) -> dict[str, object]:
+        """并发调度全部已启用账号执行邮件同步（每账号独立会话隔离）。"""
         accounts = account_repo.list_all(db)
-        total_fetched = 0
-        results: list[dict[str, object]] = []
-        for acc in accounts:
-            if not acc.is_enabled:
-                continue
-            ok, fetched, message = await imap_sync_service.sync_account(db, acc)
-            total_fetched += fetched
-            results.append({"account_id": acc.id, "ok": ok, "fetched": fetched, "message": message})
+        enabled_ids = [acc.id for acc in accounts if acc.is_enabled]
+        if not enabled_ids:
+            return {"ok": True, "fetched": 0, "results": []}
+
+        sem = asyncio.Semaphore(4)
+
+        async def _sync_one(aid: int) -> dict[str, object]:
+            async with sem:
+                with SessionLocal() as task_db:
+                    acc = account_repo.get_by_id(task_db, aid)
+                    if acc is None or not acc.is_enabled:
+                        return {"account_id": aid, "ok": True, "fetched": 0, "message": "账号已停用"}
+                    ok, fetched, message = await imap_sync_service.sync_account(
+                        task_db,
+                        acc,
+                        inbox_only=inbox_only,
+                        source=source,
+                    )
+                    return {"account_id": aid, "ok": ok, "fetched": fetched, "message": message}
+
+        results = list(await asyncio.gather(*(_sync_one(aid) for aid in enabled_ids)))
+        total_fetched = sum(int(item["fetched"]) for item in results)
         return {"ok": True, "fetched": total_fetched, "results": results}
 
-    async def sync_single_account(self, db: Session, account_id: int) -> dict[str, object]:
+    async def sync_single_account(
+        self,
+        db: Session,
+        account_id: int,
+        *,
+        inbox_only: bool = False,
+        source: str = "manual",
+    ) -> dict[str, object]:
         """调度单个邮箱立即执行同步。"""
         acc = account_repo.get_by_id(db, account_id)
         if not acc:
             raise ValueError("未找到指定邮箱账号。")
-        ok, fetched, message = await imap_sync_service.sync_account(db, acc)
+        ok, fetched, message = await imap_sync_service.sync_account(
+            db,
+            acc,
+            inbox_only=inbox_only,
+            source=source,
+        )
         return {"ok": ok, "fetched": fetched, "message": message}
+
+    async def quick_check_accounts(self, account_id: int | None = None) -> dict[str, object]:
+        """触发实时连接瞬时检查（或在未启用实时长连接时快速增量同步收件箱）。"""
+        from app.service.realtime_sync_service import realtime_sync_manager
+
+        return await realtime_sync_manager.trigger_quick_check(account_id=account_id)
 
 
 account_service = AccountService()

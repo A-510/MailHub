@@ -13,19 +13,22 @@ import re
 import smtplib
 import socket
 import ssl
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import unquote
+from weakref import WeakKeyDictionary
 
 from imapclient import IMAPClient
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.database import SessionLocal
 from app.model.entities import Account, Attachment, Email
 from app.repository.account_repo import account_repo
 from app.repository.email_repo import email_repo
 from app.repository.setting_repo import setting_repo
 from app.service.classification_service import classification_service
 from app.service.crypto_service import crypto_service
+from app.service.event_bus import mail_event_bus
 from app.service.oauth_service import oauth_service
 from app.service.provider_preset_service import (
     detect_provider_from_email,
@@ -104,6 +107,7 @@ class ImapSyncFetchResult:
     flag_updates: dict[str, dict[str, tuple[bool, bool]]] = field(default_factory=dict)
     starred_message_ids: set[str] = field(default_factory=set)
     synced_folders: list[str] = field(default_factory=list)
+    skipped_all_mail_uids: set[str] = field(default_factory=set)
 
 
 def _decode_imap_text(value: Any) -> str:
@@ -253,6 +257,25 @@ def build_smtp_transport_candidates(
         if extra not in candidates:
             candidates.append(extra)
     return candidates
+
+
+def is_imap_auth_error(exc: Exception) -> bool:
+    """判断异常是否为明确的 IMAP 认证/凭据拒绝（遇到此类错误时应拉长重试间隔）。"""
+    lower = str(exc).lower()
+    return (
+        "application-specific password required" in lower
+        or "185833" in lower
+        or "basic authentication is disabled" in lower
+        or "logindisabled" in lower
+        or "web login required" in lower
+        or "webloginrequired" in lower
+        or "unsafe login" in lower
+        or "authenticationfailed" in lower
+        or "invalid credentials" in lower
+        or "username and password not accepted" in lower
+        or "login error or password error" in lower
+        or ("auth" in lower and "fail" in lower)
+    )
 
 
 def _is_smtp_auth_error(exc: Exception) -> bool:
@@ -676,6 +699,15 @@ def _extract_envelope_message_id(payload: dict[Any, Any]) -> str:
     return _decode_imap_text(raw_mid).strip()
 
 
+def _extract_raw_message_bytes(payload: dict[Any, Any]) -> bytes | None:
+    """从 IMAP FETCH 响应字典中兼容提取原始邮件字节流（兼容 BODY[] 与 RFC822）。"""
+    for key in (b"BODY[]", "BODY[]", b"RFC822", "RFC822"):
+        raw = payload.get(key)
+        if isinstance(raw, (bytes, bytearray)):
+            return bytes(raw)
+    return None
+
+
 def _pull_single_remote_folder(
     client: IMAPClient,
     *,
@@ -685,14 +717,19 @@ def _pull_single_remote_folder(
     known_uids: set[str],
     fallback_all_when_empty: bool,
     skip_message_ids: set[str] | None = None,
+    already_selected: bool = False,
+    sync_flags: bool = True,
+    collect_skipped_uids: set[str] | None = None,
+    peek: bool = False,
 ) -> tuple[list[tuple[int, bytes, bool, bool]], dict[str, tuple[bool, bool]]]:
     """
     从已登录 IMAPClient 的单个远程文件夹增量拉取邮件：
-    1. 针对最近 limit 封仅先拉取 FLAGS 用于同步状态；
+    1. 针对最近 limit 封仅先拉取 FLAGS 用于同步状态（可选跳过）；
     2. 对 \\All 回退等场景支持通过 ENVELOPE 预过滤已知 Message-ID；
-    3. 仅对真正缺失的 UID 拉取完整 RFC822 原文，减少流量与解析开销。
+    3. 仅对真正缺失的 UID 拉取完整原文，减少流量与解析开销。
     """
-    client.select_folder(remote_folder, readonly=True)
+    if not already_selected:
+        client.select_folder(remote_folder, readonly=True)
     uids: list[int] = []
     if sync_days > 0:
         since_date = (datetime.now(timezone.utc) - timedelta(days=sync_days)).date()
@@ -710,12 +747,13 @@ def _pull_single_remote_folder(
         return [], {}
 
     target_uids = sorted(uids)[-limit:]
-    flags_payload_map = client.fetch(target_uids, ["FLAGS"])
     folder_flag_updates: dict[str, tuple[bool, bool]] = {}
-    for uid in target_uids:
-        payload = flags_payload_map.get(uid) or {}
-        raw_flags = payload.get(b"FLAGS") if b"FLAGS" in payload else payload.get("FLAGS")
-        folder_flag_updates[str(uid)] = _parse_imap_flags(raw_flags)
+    if sync_flags:
+        flags_payload_map = client.fetch(target_uids, ["FLAGS"])
+        for uid in target_uids:
+            payload = flags_payload_map.get(uid) or {}
+            raw_flags = payload.get(b"FLAGS") if b"FLAGS" in payload else payload.get("FLAGS")
+            folder_flag_updates[str(uid)] = _parse_imap_flags(raw_flags)
 
     new_uids = [uid for uid in target_uids if str(uid) not in known_uids]
     if new_uids and skip_message_ids:
@@ -726,6 +764,8 @@ def _pull_single_remote_folder(
                 env_payload = env_map.get(uid) or {}
                 mid = _extract_envelope_message_id(env_payload).lower()
                 if mid and mid in skip_message_ids:
+                    if collect_skipped_uids is not None:
+                        collect_skipped_uids.add(str(uid))
                     continue
                 filtered_uids.append(uid)
             new_uids = filtered_uids
@@ -735,20 +775,153 @@ def _pull_single_remote_folder(
     if not new_uids:
         return [], folder_flag_updates
 
-    fetched = client.fetch(new_uids, ["RFC822", "FLAGS"])
+    body_item = "BODY.PEEK[]" if peek else "RFC822"
+    fetched = client.fetch(new_uids, [body_item, "FLAGS"])
     new_messages: list[tuple[int, bytes, bool, bool]] = []
     for uid in reversed(new_uids):
         payload = fetched.get(uid) or {}
-        raw_bytes = payload.get(b"RFC822") if b"RFC822" in payload else payload.get("RFC822")
-        if not isinstance(raw_bytes, (bytes, bytearray)):
+        raw_bytes = _extract_raw_message_bytes(payload)
+        if raw_bytes is None:
             continue
         raw_flags = payload.get(b"FLAGS") if b"FLAGS" in payload else payload.get("FLAGS")
         if raw_flags is not None:
             is_read, is_starred = _parse_imap_flags(raw_flags)
         else:
             is_read, is_starred = folder_flag_updates.get(str(uid), (False, False))
-        new_messages.append((int(uid), bytes(raw_bytes), is_read, is_starred))
+        new_messages.append((int(uid), raw_bytes, is_read, is_starred))
     return new_messages, folder_flag_updates
+
+
+def _extract_uidnext(select_info: Any) -> int | None:
+    """从 IMAP SELECT 响应字典中解析 UIDNEXT 正整数值。"""
+    if not isinstance(select_info, dict):
+        return None
+    raw = select_info.get(b"UIDNEXT") if b"UIDNEXT" in select_info else select_info.get("UIDNEXT")
+    if raw is None:
+        return None
+    try:
+        val = int(raw)
+        return val if val > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _pull_inbox_incremental_on_client(
+    client: IMAPClient,
+    *,
+    known_uids: set[str],
+    sync_days: int,
+    limit: int = 35,
+    select_first: bool = False,
+    readonly: bool = False,
+    send_noop: bool = False,
+    select_info: Any = None,
+) -> ImapSyncFetchResult:
+    """
+    在已认证连接上极速增量检查 INBOX 新邮件：
+    1. 支持 SELECT(readonly=False) 与 BODY.PEEK[] 抓包，既确保服务端正常推送 IDLE 事件，又不误修改未读标志；
+    2. 利用 SELECT UIDNEXT 短路与 `UID <max+1>:*` 范围检索，跳过 list_folders 与其余文件夹；
+    3. 首次空库或 UID 搜索不受支持时安全回退至标准 SINCE 搜索。
+    """
+    result = ImapSyncFetchResult(synced_folders=["inbox"])
+    effective_select_info = select_info
+    if select_first:
+        effective_select_info = client.select_folder("INBOX", readonly=readonly)
+    elif send_noop:
+        try:
+            client.noop()
+        except Exception as exc:
+            logger.debug("IMAP NOOP before incremental check warning: %s", exc)
+
+    numeric_known = [int(u) for u in known_uids if u.isdigit()]
+    max_known_uid = max(numeric_known) if numeric_known else 0
+
+    if max_known_uid > 0:
+        uidnext = _extract_uidnext(effective_select_info)
+        # 若服务端返回的 UIDNEXT 恰好为 max_known_uid + 1，说明自上次同步以来无任何新邮件入箱
+        if uidnext is not None and uidnext == max_known_uid + 1:
+            return result
+
+        # 若 UIDNEXT <= max_known_uid（例如服务器重建邮箱导致 UIDVALIDITY 变更/回绕），降级走普通扫描
+        if uidnext is None or uidnext > max_known_uid + 1:
+            try:
+                raw_uids = client.search(["UID", f"{max_known_uid + 1}:*"])
+                # NOTE: RFC 3501 中 a:* 在最大 UID 小于 a 时会被解释为 max_uid:a，故必须再次过滤 u > max_known_uid
+                new_uids = [
+                    int(u)
+                    for u in sorted(int(x) for x in raw_uids)
+                    if int(u) > max_known_uid and str(int(u)) not in known_uids
+                ][-limit:]
+                if not new_uids:
+                    return result
+
+                fetched = client.fetch(new_uids, ["BODY.PEEK[]", "FLAGS"])
+                for uid in reversed(new_uids):
+                    payload = fetched.get(uid) or {}
+                    raw_bytes = _extract_raw_message_bytes(payload)
+                    if raw_bytes is None:
+                        continue
+                    raw_flags = payload.get(b"FLAGS") if b"FLAGS" in payload else payload.get("FLAGS")
+                    is_read, is_starred = _parse_imap_flags(raw_flags)
+                    result.new_messages.append(("inbox", int(uid), raw_bytes, is_read, is_starred))
+                return result
+            except Exception as exc:
+                logger.warning("IMAP UID range search failed on INBOX (%s), falling back to SINCE", exc)
+
+    new_msgs, _ = _pull_single_remote_folder(
+        client,
+        remote_folder="INBOX",
+        sync_days=sync_days,
+        limit=limit,
+        known_uids=known_uids,
+        fallback_all_when_empty=False,
+        already_selected=True,
+        sync_flags=False,
+        peek=True,
+    )
+    for uid, raw_bytes, is_read, is_starred in new_msgs:
+        result.new_messages.append(("inbox", uid, raw_bytes, is_read, is_starred))
+    return result
+
+
+def _fetch_imap_inbox_only(
+    *,
+    host: str,
+    port: int,
+    use_ssl: bool,
+    email_addr: str,
+    secret: str,
+    auth_type: str,
+    provider: str,
+    sync_days: int,
+    known_inbox_uids: set[str] | None = None,
+    limit: int = 35,
+) -> ImapSyncFetchResult:
+    """
+    轻量单收件箱连接入口：跳过 list_folders 与发件箱/草稿箱/归档/垃圾/回收站，仅增量拉取 INBOX 新邮件。
+    """
+    client = _imap_connect_and_auth(
+        host=host,
+        port=port,
+        use_ssl=use_ssl,
+        email_addr=email_addr,
+        secret=secret,
+        auth_type=auth_type,
+        provider=provider,
+    )
+    try:
+        return _pull_inbox_incremental_on_client(
+            client,
+            known_uids=known_inbox_uids or set(),
+            sync_days=sync_days,
+            limit=limit,
+            select_first=True,
+        )
+    finally:
+        try:
+            client.logout()
+        except Exception:
+            pass
 
 
 def _fetch_imap_folder_messages(
@@ -763,12 +936,14 @@ def _fetch_imap_folder_messages(
     sync_days: int,
     existing_uids_by_folder: dict[str, set[str]] | None = None,
     known_message_ids: set[str] | None = None,
+    skip_all_mail_uids: set[str] | None = None,
     inbox_limit: int = 35,
     other_limit: int = 25,
+    on_inbox_ready: Callable[[list[tuple[int, bytes, bool, bool]], dict[str, tuple[bool, bool]]], None] | None = None,
 ) -> ImapSyncFetchResult:
     """
     单次连接复用并自动发现同步各邮箱标准文件夹（收件箱、发件箱、草稿箱、归档、垃圾邮件、回收站），
-    同时兼容 Gmail \\All 归档回退与虚拟星标目录状态同步。
+    支持在收件箱拉取完毕后通过 on_inbox_ready 回调提前落库并推给前端，同时兼容 Gmail \\All 归档回退与虚拟星标目录。
     """
     client = _imap_connect_and_auth(
         host=host,
@@ -807,10 +982,15 @@ def _fetch_imap_folder_messages(
                     fallback_all_when_empty=False,
                 )
                 result.synced_folders.append(local_folder)
-                if flag_updates:
-                    result.flag_updates[local_folder] = flag_updates
-                for uid, raw_bytes, is_read, is_starred in new_msgs:
-                    result.new_messages.append((local_folder, uid, raw_bytes, is_read, is_starred))
+                if on_inbox_ready is not None:
+                    # 提前将收件箱新邮件与状态变更落库推送，不等候后续慢速目录完成
+                    if new_msgs or flag_updates:
+                        on_inbox_ready(new_msgs, flag_updates)
+                else:
+                    if flag_updates:
+                        result.flag_updates[local_folder] = flag_updates
+                    for uid, raw_bytes, is_read, is_starred in new_msgs:
+                        result.new_messages.append((local_folder, uid, raw_bytes, is_read, is_starred))
             else:
                 # 非收件箱单个目录异常不阻断整个账号同步，保证其余目录正常可用
                 try:
@@ -839,14 +1019,19 @@ def _fetch_imap_folder_messages(
         # Gmail 等未单独提供 Archive 目录但提供 \All 全部邮件目录时，补全已归档邮件
         if "archive" not in folder_map and all_mail_remote_folder:
             try:
+                all_known = set(existing_map.get("archive", set()))
+                if skip_all_mail_uids:
+                    all_known |= skip_all_mail_uids
                 all_msgs, _ = _pull_single_remote_folder(
                     client,
                     remote_folder=all_mail_remote_folder,
                     sync_days=sync_days,
                     limit=other_limit,
-                    known_uids=existing_map.get("archive", set()),
+                    known_uids=all_known,
                     fallback_all_when_empty=True,
                     skip_message_ids=known_message_ids,
+                    sync_flags=False,
+                    collect_skipped_uids=result.skipped_all_mail_uids,
                 )
                 for uid, raw_bytes, is_read, is_starred in all_msgs:
                     result.new_messages.append(("archive_fallback", uid, raw_bytes, is_read, is_starred))
@@ -858,11 +1043,22 @@ def _fetch_imap_folder_messages(
                     exc,
                 )
 
-        # 若服务器存在虚拟星标目录（如 [Gmail]/Starred），补充对应 Message-ID 星标状态
+        # 若服务器存在虚拟星标目录（如 [Gmail]/Starred），补充对应 Message-ID 星标状态（优先按 sync_days 缩小范围）
         if starred_remote_folder:
             try:
                 client.select_folder(starred_remote_folder, readonly=True)
-                starred_uids = [int(u) for u in client.search(["ALL"])]
+                starred_uids: list[int] = []
+                if sync_days > 0:
+                    since_date = (datetime.now(timezone.utc) - timedelta(days=sync_days)).date()
+                    try:
+                        starred_uids = [int(u) for u in client.search(["SINCE", since_date])]
+                    except Exception:
+                        starred_uids = [int(u) for u in client.search(["ALL"])]
+                    if not starred_uids:
+                        starred_uids = [int(u) for u in client.search(["ALL"])]
+                else:
+                    starred_uids = [int(u) for u in client.search(["ALL"])]
+
                 if starred_uids:
                     target_starred_uids = sorted(starred_uids)[-other_limit:]
                     env_fetched = client.fetch(target_starred_uids, ["ENVELOPE"])
@@ -929,7 +1125,40 @@ def _fetch_imap_raw_messages(
 
 
 class ImapSyncService:
-    """IMAP 同步与测试连接服务。"""
+    """IMAP 同步、增量入库与测试连接服务。"""
+
+    def __init__(self) -> None:
+        # 按事件循环隔离单账号异步互斥锁，避免手动同步、定时全量与 IDLE 推送同时写入产生重复邮件
+        self._loop_locks: WeakKeyDictionary[asyncio.AbstractEventLoop, dict[int, asyncio.Lock]] = WeakKeyDictionary()
+        # 缓存已在 \All 全部邮件中确认属于其他文件夹的 UID，避免每次 Gmail 全量同步重拉 ENVELOPE
+        self._checked_all_mail_uids: dict[int, set[str]] = {}
+
+    def _get_account_lock(self, account_id: int) -> asyncio.Lock:
+        """获取当前运行事件循环下对应账号的互斥锁。"""
+        loop = asyncio.get_running_loop()
+        locks_by_acc = self._loop_locks.get(loop)
+        if locks_by_acc is None:
+            locks_by_acc = {}
+            self._loop_locks[loop] = locks_by_acc
+        lock = locks_by_acc.get(account_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks_by_acc[account_id] = lock
+        return lock
+
+    def _record_checked_all_mail_uids(self, account_id: int, uids: set[str]) -> None:
+        """记录无需再拉取 ENVELOPE 的 \\All UID，并限制单账号内存缓存上限为 500。"""
+        if not uids:
+            return
+        cache = self._checked_all_mail_uids.setdefault(account_id, set())
+        cache.update(uids)
+        if len(cache) > 500:
+            numeric = sorted((int(u) for u in cache if u.isdigit()), reverse=True)[:500]
+            self._checked_all_mail_uids[account_id] = {str(u) for u in numeric}
+
+    def clear_account_cache(self, account_id: int) -> None:
+        """账号删除或重置时清理内存缓存。"""
+        self._checked_all_mail_uids.pop(account_id, None)
 
     def resolve_server_defaults(
         self,
@@ -990,10 +1219,331 @@ class ImapSyncService:
         )
         return (imap_ok and smtp_ok), imap_ok, smtp_ok, msg, resolved_smtp_port, resolved_smtp_ssl
 
-    async def sync_account(self, db: Session, account: Account) -> tuple[bool, int, str]:
+    def _persist_fetch_result(
+        self,
+        db: Session,
+        account: Account,
+        fetch_result: ImapSyncFetchResult,
+        *,
+        uid_maps: dict[str, dict[str, Email]] | None = None,
+        existing_uids_by_folder: dict[str, set[str]] | None = None,
+        sent_msg_id_map: dict[str, Email] | None = None,
+        drafts_msg_id_map: dict[str, Email] | None = None,
+        all_account_msg_ids: set[str] | None = None,
+        mode: str = "full",
+        source: str = "manual",
+        record_log: bool = True,
+        update_account_status: bool = True,
+        prior_inserted_by_folder: dict[str, int] | None = None,
+    ) -> tuple[bool, int, str]:
+        """将拉取结果去重落库、更新状态标志、按策略记录日志并推送 SSE 事件。"""
+        if uid_maps is None:
+            uid_maps = {
+                folder: email_repo.get_uid_map_by_folder(db, account.id, folder)
+                for folder in SYNC_FOLDER_ORDER
+            }
+        if existing_uids_by_folder is None:
+            existing_uids_by_folder = {
+                folder: set(uid_map.keys()) for folder, uid_map in uid_maps.items()
+            }
+        if sent_msg_id_map is None:
+            sent_msg_id_map = email_repo.get_message_id_map_by_folder(db, account.id, "sent")
+        if drafts_msg_id_map is None:
+            drafts_msg_id_map = email_repo.get_message_id_map_by_folder(db, account.id, "drafts")
+        if all_account_msg_ids is None:
+            all_account_msg_ids = email_repo.get_all_message_ids_for_account(db, account.id)
+
+        # 1. 同步已存在邮件的远程已读与星标标志
+        flags_updated = 0
+        for folder, folder_flags in fetch_result.flag_updates.items():
+            folder_uid_map = uid_maps.get(folder, {})
+            for uid_str, (remote_read, remote_starred) in folder_flags.items():
+                existing_email = folder_uid_map.get(uid_str)
+                if existing_email is None:
+                    continue
+                target_read = True if folder in ("sent", "drafts") else remote_read
+                changed = False
+                if existing_email.is_read != target_read:
+                    existing_email.is_read = target_read
+                    changed = True
+                if existing_email.is_starred != remote_starred:
+                    existing_email.is_starred = remote_starred
+                    changed = True
+                if changed:
+                    email_repo.save(db, existing_email)
+                    flags_updated += 1
+
+        # 2. 先入库 6 个标准文件夹新邮件，再处理 Gmail \All 归档回退
+        ordered_messages = [
+            item for item in fetch_result.new_messages if item[0] != "archive_fallback"
+        ] + [
+            item for item in fetch_result.new_messages if item[0] == "archive_fallback"
+        ]
+
+        inserted = 0
+        inbox_inserted = 0
+        inserted_by_folder: dict[str, int] = {}
+        extra_skipped_all_uids: set[str] = set()
+        latest_subject = ""
+        latest_sender = ""
+        latest_priority = -1
+        latest_received_at: datetime | None = None
+
+        for source_folder, uid, raw_bytes, is_read, is_starred in ordered_messages:
+            uid_str = str(uid)
+            is_archive_fallback = source_folder == "archive_fallback"
+            target_folder = "archive" if is_archive_fallback else source_folder
+
+            if uid_str in existing_uids_by_folder.get(target_folder, set()):
+                continue
+
+            msg = py_email.message_from_bytes(raw_bytes)
+            message_id = (msg.get("Message-ID") or "").strip()
+            norm_mid = message_id.lower()
+
+            # \All 归档回退仅收割尚不存在于当前账号任意文件夹中的已归档邮件
+            if is_archive_fallback:
+                if not norm_mid or norm_mid in all_account_msg_ids:
+                    extra_skipped_all_uids.add(uid_str)
+                    continue
+
+            # 发件箱/草稿箱按同文件夹 Message-ID 与本地发出/保存记录去重并升级为真实 IMAP UID
+            if target_folder in ("sent", "drafts") and norm_mid:
+                folder_mid_map = sent_msg_id_map if target_folder == "sent" else drafts_msg_id_map
+                dup_email = folder_mid_map.get(norm_mid)
+                if dup_email is not None:
+                    changed = False
+                    if dup_email.message_uid.startswith(("sent-", "draft-")):
+                        dup_email.message_uid = uid_str
+                        existing_uids_by_folder.setdefault(target_folder, set()).add(uid_str)
+                        changed = True
+                    if dup_email.is_starred != is_starred:
+                        dup_email.is_starred = is_starred
+                        changed = True
+                    if changed:
+                        email_repo.save(db, dup_email)
+                        flags_updated += 1
+                    continue
+
+            from_list = [
+                (name, addr.strip())
+                for name, addr in getaddresses([msg.get("From", "")])
+                if name.strip() or addr.strip()
+            ]
+            if from_list:
+                sender_name = _decode_mime_text(from_list[0][0]) or from_list[0][1] or "未知发件人"
+                sender_email = from_list[0][1] or (
+                    account.email if target_folder in ("sent", "drafts") else "unknown@example.com"
+                )
+            elif target_folder in ("sent", "drafts"):
+                sender_name = account.label
+                sender_email = account.email
+            else:
+                sender_name = "未知发件人"
+                sender_email = "unknown@example.com"
+
+            subject = _decode_mime_text(msg.get("Subject")) or "(无主题)"
+            to_addrs = _parse_address_list(msg.get_all("To", []))
+            cc_addrs = _parse_address_list(msg.get_all("Cc", []))
+
+            raw_date = msg.get("Date")
+            received_at = datetime.now(timezone.utc)
+            if raw_date:
+                try:
+                    parsed_dt = parsedate_to_datetime(raw_date)
+                    if parsed_dt.tzinfo is None:
+                        parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
+                    received_at = parsed_dt.astimezone(timezone.utc)
+                except Exception:
+                    pass
+
+            text_body, html_body, attachments_meta = _extract_email_parts(
+                msg, account.id, uid_str, folder=target_folder
+            )
+            snippet = _build_snippet(text_body, html_body)
+            category = classification_service.classify(db, sender_email, sender_name, subject)
+            has_remote_images = bool(REMOTE_IMG_PATTERN.search(html_body))
+            final_is_read = True if target_folder in ("sent", "drafts") else is_read
+
+            headers_lines = [f"{k}: {_decode_mime_text(v)}" for k, v in list(msg.items())[:25]]
+            email_entity = Email(
+                account_id=account.id,
+                message_uid=uid_str,
+                message_id=message_id,
+                folder=target_folder,
+                category=category,
+                sender_name=sender_name,
+                sender_email=sender_email,
+                sender_avatar_key=sender_email.split("@")[-1].split(".")[0] if "@" in sender_email else "mail",
+                to_addresses=to_addrs or [account.email],
+                cc_addresses=cc_addrs,
+                bcc_addresses=[],
+                subject=subject,
+                snippet=snippet,
+                html_body=html_body,
+                text_body=text_body,
+                has_remote_images=has_remote_images,
+                is_read=final_is_read,
+                is_starred=is_starred,
+                has_attachments=len(attachments_meta) > 0,
+                raw_headers="\n".join(headers_lines),
+                received_at=received_at,
+            )
+            for att in attachments_meta:
+                email_entity.attachments.append(
+                    Attachment(
+                        filename=att["filename"],
+                        content_type=att["content_type"],
+                        size_bytes=att["size_bytes"],
+                        local_path=att["local_path"],
+                    )
+                )
+            email_repo.create(db, email_entity)
+            existing_uids_by_folder.setdefault(target_folder, set()).add(uid_str)
+            if norm_mid:
+                all_account_msg_ids.add(norm_mid)
+                if target_folder == "sent":
+                    sent_msg_id_map.setdefault(norm_mid, email_entity)
+                elif target_folder == "drafts":
+                    drafts_msg_id_map.setdefault(norm_mid, email_entity)
+
+            inserted += 1
+            inserted_by_folder[target_folder] = inserted_by_folder.get(target_folder, 0) + 1
+            if target_folder == "inbox":
+                inbox_inserted += 1
+
+            # 优先记录未读收件箱邮件用于桌面/Toast 提醒预览
+            priority = 3 if (target_folder == "inbox" and not final_is_read) else (2 if target_folder == "inbox" else 1)
+            if priority > latest_priority or (
+                priority == latest_priority and (latest_received_at is None or received_at > latest_received_at)
+            ):
+                latest_priority = priority
+                latest_received_at = received_at
+                latest_subject = subject
+                latest_sender = sender_name
+
+        self._record_checked_all_mail_uids(account.id, fetch_result.skipped_all_mail_uids | extra_skipped_all_uids)
+
+        # 3. 补充虚拟星标目录中的星标标记
+        if fetch_result.starred_message_ids:
+            flags_updated += email_repo.mark_starred_by_message_ids(db, account.id, fetch_result.starred_message_ids)
+
+        if update_account_status:
+            account.last_synced_at = datetime.now(timezone.utc)
+            account.sync_status = "idle"
+            account.last_error = None
+            account_repo.save(db, account)
+
+        # 汇总包含早期 inbox 入库在内的总条数（用于完整 SyncLog 与返回值）
+        merged_by_folder = dict(inserted_by_folder)
+        prior_total = 0
+        if prior_inserted_by_folder:
+            for folder_key, cnt in prior_inserted_by_folder.items():
+                if cnt > 0:
+                    merged_by_folder[folder_key] = merged_by_folder.get(folder_key, 0) + cnt
+                    prior_total += cnt
+        total_inserted = inserted + prior_total
+
+        if total_inserted > 0:
+            detail_parts = [
+                f"{FOLDER_LABELS_ZH.get(folder, folder)} {merged_by_folder[folder]}"
+                for folder in SYNC_FOLDER_ORDER
+                if merged_by_folder.get(folder, 0) > 0
+            ]
+            detail_suffix = f"（{'、'.join(detail_parts)}）" if detail_parts else ""
+            msg_text = f"{account.label} 同步完成，新增 {total_inserted} 封邮件{detail_suffix}"
+        else:
+            msg_text = f"{account.label} 同步完成，各文件夹均为最新状态"
+
+        # 手动同步始终记录日志；后台自动同步仅在有新邮件时写入，避免空闲轮询刷屏日志表
+        if record_log and (source == "manual" or total_inserted > 0):
+            account_repo.add_sync_log(db, account.id, "success", total_inserted, msg_text)
+
+        # 仅针对本次新落库/变更广播 SSE，防止早期收件箱已广播后重复推送
+        if inserted > 0 or flags_updated > 0:
+            mail_event_bus.publish(
+                "mail_synced",
+                {
+                    "account_id": account.id,
+                    "account_label": account.label,
+                    "notify_enabled": bool(account.notify_enabled),
+                    "fetched_count": inserted,
+                    "inbox_fetched_count": inbox_inserted,
+                    "flags_updated": flags_updated,
+                    "mode": mode,
+                    "source": source,
+                    "latest_subject": latest_subject,
+                    "latest_sender": latest_sender,
+                },
+            )
+
+        return True, total_inserted, msg_text
+
+    async def ingest_fetch_result(
+        self,
+        account_id: int,
+        fetch_result: ImapSyncFetchResult,
+        *,
+        mode: str = "inbox",
+        source: str = "idle",
+    ) -> tuple[bool, int, str]:
+        """在单账号互斥锁保护下，将后台 IDLE / 快速轮询拉取到的邮件入库并广播 SSE 事件。"""
+        async with self._get_account_lock(account_id):
+            with SessionLocal() as db:
+                account = account_repo.get_by_id(db, account_id)
+                if account is None or not account.is_enabled or account.is_demo:
+                    return True, 0, "账号不存在或已停用"
+                return self._persist_fetch_result(
+                    db,
+                    account,
+                    fetch_result,
+                    mode=mode,
+                    source=source,
+                )
+
+    def mark_realtime_connected(self, account_id: int) -> None:
+        """长连接成功就绪后清除残留错误状态并刷新同步时间。"""
+        with SessionLocal() as db:
+            account = account_repo.get_by_id(db, account_id)
+            if account is None or not account.is_enabled or account.is_demo:
+                return
+            if account.sync_status == "error" or account.last_error is not None:
+                account.sync_status = "idle"
+                account.last_error = None
+                account.last_synced_at = datetime.now(timezone.utc)
+                account_repo.save(db, account)
+
+    def record_realtime_error(self, account_id: int, exc: Exception) -> None:
+        """记录长连接异常状态（仅当错误文本变化时写入 SyncLog 避免重复刷屏）。"""
+        with SessionLocal() as db:
+            account = account_repo.get_by_id(db, account_id)
+            if account is None or not account.is_enabled or account.is_demo:
+                return
+            friendly_err = format_mail_auth_error(exc, account.provider)
+            changed = account.last_error != friendly_err
+            account.sync_status = "error"
+            account.last_error = friendly_err
+            account_repo.save(db, account)
+            if changed:
+                account_repo.add_sync_log(
+                    db,
+                    account.id,
+                    "error",
+                    0,
+                    f"{account.label} 实时收信连接异常：{friendly_err}",
+                )
+
+    async def sync_account(
+        self,
+        db: Session,
+        account: Account,
+        *,
+        inbox_only: bool = False,
+        source: str = "manual",
+    ) -> tuple[bool, int, str]:
         """
         同步单个邮箱账号的最新邮件至 SQLite。
-        对演示账号直接跳过远程连接并刷新同步时间戳。
+        支持 `inbox_only=True` 快速通道（仅增量查收件箱），并通过单账号锁避免与实时推送并发重入。
         """
         if account.is_demo:
             account.last_synced_at = datetime.now(timezone.utc)
@@ -1005,224 +1555,162 @@ class ImapSyncService:
         if not account.is_enabled:
             return True, 0, f"{account.label} 已停用同步"
 
-        account.sync_status = "syncing"
-        account_repo.save(db, account)
+        async with self._get_account_lock(account.id):
+            db.refresh(account)
+            if not account.is_enabled:
+                return True, 0, f"{account.label} 已停用同步"
 
-        try:
-            if account.auth_type == "oauth2":
-                secret = await oauth_service.ensure_valid_access_token(db, account)
-            else:
-                raw_secret = crypto_service.decrypt(account.encrypted_secret) or ""
-                secret = normalize_secret(account.provider, raw_secret, account.imap_host)
+            if source == "manual":
+                account.sync_status = "syncing"
+                account_repo.save(db, account)
 
-            if not secret:
-                raise RuntimeError("未找到有效登录凭据，请在设置中重新输入密码或完成浏览器授权。")
-
-            app_settings = setting_repo.get_all(db)
-            sync_days = int(app_settings.get("sync_days", 30))
-
-            # 预加载各标准文件夹已有 UID 与去重索引，避免重复下载 RFC822 原文
-            uid_maps: dict[str, dict[str, Email]] = {
-                folder: email_repo.get_uid_map_by_folder(db, account.id, folder)
-                for folder in SYNC_FOLDER_ORDER
-            }
-            existing_uids_by_folder: dict[str, set[str]] = {
-                folder: set(uid_map.keys()) for folder, uid_map in uid_maps.items()
-            }
-            sent_msg_id_map = email_repo.get_message_id_map_by_folder(db, account.id, "sent")
-            drafts_msg_id_map = email_repo.get_message_id_map_by_folder(db, account.id, "drafts")
-            all_account_msg_ids = email_repo.get_all_message_ids_for_account(db, account.id)
-
-            fetch_result = await asyncio.to_thread(
-                _fetch_imap_folder_messages,
-                host=account.imap_host,
-                port=account.imap_port,
-                use_ssl=account.imap_ssl,
-                email_addr=account.email,
-                secret=secret,
-                auth_type=account.auth_type,
-                provider=account.provider,
-                sync_days=sync_days,
-                existing_uids_by_folder=existing_uids_by_folder,
-                known_message_ids=all_account_msg_ids,
-            )
-
-            # 1. 同步已存在邮件的远程已读与星标标志
-            for folder, folder_flags in fetch_result.flag_updates.items():
-                folder_uid_map = uid_maps.get(folder, {})
-                for uid_str, (remote_read, remote_starred) in folder_flags.items():
-                    existing_email = folder_uid_map.get(uid_str)
-                    if existing_email is None:
-                        continue
-                    target_read = True if folder in ("sent", "drafts") else remote_read
-                    changed = False
-                    if existing_email.is_read != target_read:
-                        existing_email.is_read = target_read
-                        changed = True
-                    if existing_email.is_starred != remote_starred:
-                        existing_email.is_starred = remote_starred
-                        changed = True
-                    if changed:
-                        email_repo.save(db, existing_email)
-
-            # 2. 先入库 6 个标准文件夹新邮件，再处理 Gmail \All 归档回退
-            ordered_messages = [
-                item for item in fetch_result.new_messages if item[0] != "archive_fallback"
-            ] + [
-                item for item in fetch_result.new_messages if item[0] == "archive_fallback"
-            ]
-
-            inserted = 0
-            inserted_by_folder: dict[str, int] = {}
-            for source_folder, uid, raw_bytes, is_read, is_starred in ordered_messages:
-                uid_str = str(uid)
-                is_archive_fallback = source_folder == "archive_fallback"
-                target_folder = "archive" if is_archive_fallback else source_folder
-
-                if uid_str in existing_uids_by_folder.get(target_folder, set()):
-                    continue
-
-                msg = py_email.message_from_bytes(raw_bytes)
-                message_id = (msg.get("Message-ID") or "").strip()
-                norm_mid = message_id.lower()
-
-                # \All 归档回退仅收割尚不存在于当前账号任意文件夹中的已归档邮件
-                if is_archive_fallback:
-                    if not norm_mid or norm_mid in all_account_msg_ids:
-                        continue
-
-                # 发件箱/草稿箱按同文件夹 Message-ID 与本地发出/保存记录去重并升级为真实 IMAP UID
-                if target_folder in ("sent", "drafts") and norm_mid:
-                    folder_mid_map = sent_msg_id_map if target_folder == "sent" else drafts_msg_id_map
-                    dup_email = folder_mid_map.get(norm_mid)
-                    if dup_email is not None:
-                        changed = False
-                        if dup_email.message_uid.startswith(("sent-", "draft-")):
-                            dup_email.message_uid = uid_str
-                            existing_uids_by_folder.setdefault(target_folder, set()).add(uid_str)
-                            changed = True
-                        if dup_email.is_starred != is_starred:
-                            dup_email.is_starred = is_starred
-                            changed = True
-                        if changed:
-                            email_repo.save(db, dup_email)
-                        continue
-
-                from_list = [
-                    (name, addr.strip())
-                    for name, addr in getaddresses([msg.get("From", "")])
-                    if name.strip() or addr.strip()
-                ]
-                if from_list:
-                    sender_name = _decode_mime_text(from_list[0][0]) or from_list[0][1] or "未知发件人"
-                    sender_email = from_list[0][1] or (
-                        account.email if target_folder in ("sent", "drafts") else "unknown@example.com"
-                    )
-                elif target_folder in ("sent", "drafts"):
-                    sender_name = account.label
-                    sender_email = account.email
+            try:
+                if account.auth_type == "oauth2":
+                    secret = await oauth_service.ensure_valid_access_token(db, account)
                 else:
-                    sender_name = "未知发件人"
-                    sender_email = "unknown@example.com"
+                    raw_secret = crypto_service.decrypt(account.encrypted_secret) or ""
+                    secret = normalize_secret(account.provider, raw_secret, account.imap_host)
 
-                subject = _decode_mime_text(msg.get("Subject")) or "(无主题)"
-                to_addrs = _parse_address_list(msg.get_all("To", []))
-                cc_addrs = _parse_address_list(msg.get_all("Cc", []))
+                if not secret:
+                    raise RuntimeError("未找到有效登录凭据，请在设置中重新输入密码或完成浏览器授权。")
 
-                raw_date = msg.get("Date")
-                received_at = datetime.now(timezone.utc)
-                if raw_date:
-                    try:
-                        parsed_dt = parsedate_to_datetime(raw_date)
-                        if parsed_dt.tzinfo is None:
-                            parsed_dt = parsed_dt.replace(tzinfo=timezone.utc)
-                        received_at = parsed_dt.astimezone(timezone.utc)
-                    except Exception:
-                        pass
+                app_settings = setting_repo.get_all(db)
+                sync_days = int(app_settings.get("sync_days", 30))
 
-                text_body, html_body, attachments_meta = _extract_email_parts(
-                    msg, account.id, uid_str, folder=target_folder
-                )
-                snippet = _build_snippet(text_body, html_body)
-                category = classification_service.classify(db, sender_email, sender_name, subject)
-                has_remote_images = bool(REMOTE_IMG_PATTERN.search(html_body))
-                final_is_read = True if target_folder in ("sent", "drafts") else is_read
-
-                headers_lines = [f"{k}: {_decode_mime_text(v)}" for k, v in list(msg.items())[:25]]
-                email_entity = Email(
-                    account_id=account.id,
-                    message_uid=uid_str,
-                    message_id=message_id,
-                    folder=target_folder,
-                    category=category,
-                    sender_name=sender_name,
-                    sender_email=sender_email,
-                    sender_avatar_key=sender_email.split("@")[-1].split(".")[0] if "@" in sender_email else "mail",
-                    to_addresses=to_addrs or [account.email],
-                    cc_addresses=cc_addrs,
-                    bcc_addresses=[],
-                    subject=subject,
-                    snippet=snippet,
-                    html_body=html_body,
-                    text_body=text_body,
-                    has_remote_images=has_remote_images,
-                    is_read=final_is_read,
-                    is_starred=is_starred,
-                    has_attachments=len(attachments_meta) > 0,
-                    raw_headers="\n".join(headers_lines),
-                    received_at=received_at,
-                )
-                for att in attachments_meta:
-                    email_entity.attachments.append(
-                        Attachment(
-                            filename=att["filename"],
-                            content_type=att["content_type"],
-                            size_bytes=att["size_bytes"],
-                            local_path=att["local_path"],
-                        )
+                if inbox_only:
+                    known_inbox_uids = email_repo.get_uids_by_folder(db, account.id, "inbox")
+                    fetch_result = await asyncio.to_thread(
+                        _fetch_imap_inbox_only,
+                        host=account.imap_host,
+                        port=account.imap_port,
+                        use_ssl=account.imap_ssl,
+                        email_addr=account.email,
+                        secret=secret,
+                        auth_type=account.auth_type,
+                        provider=account.provider,
+                        sync_days=sync_days,
+                        known_inbox_uids=known_inbox_uids,
                     )
-                email_repo.create(db, email_entity)
-                existing_uids_by_folder.setdefault(target_folder, set()).add(uid_str)
-                if norm_mid:
-                    all_account_msg_ids.add(norm_mid)
-                    if target_folder == "sent":
-                        sent_msg_id_map.setdefault(norm_mid, email_entity)
-                    elif target_folder == "drafts":
-                        drafts_msg_id_map.setdefault(norm_mid, email_entity)
+                    return self._persist_fetch_result(
+                        db,
+                        account,
+                        fetch_result,
+                        existing_uids_by_folder={"inbox": known_inbox_uids},
+                        uid_maps={},
+                        mode="inbox",
+                        source=source,
+                    )
 
-                inserted += 1
-                inserted_by_folder[target_folder] = inserted_by_folder.get(target_folder, 0) + 1
-
-            # 3. 补充虚拟星标目录中的星标标记
-            if fetch_result.starred_message_ids:
-                email_repo.mark_starred_by_message_ids(db, account.id, fetch_result.starred_message_ids)
-
-            account.last_synced_at = datetime.now(timezone.utc)
-            account.sync_status = "idle"
-            account.last_error = None
-            account_repo.save(db, account)
-
-            if inserted > 0:
-                detail_parts = [
-                    f"{FOLDER_LABELS_ZH.get(folder, folder)} {inserted_by_folder[folder]}"
+                # 全量模式：预加载各标准文件夹已有 UID 与去重索引，避免重复下载 RFC822 原文
+                uid_maps: dict[str, dict[str, Email]] = {
+                    folder: email_repo.get_uid_map_by_folder(db, account.id, folder)
                     for folder in SYNC_FOLDER_ORDER
-                    if inserted_by_folder.get(folder, 0) > 0
-                ]
-                detail_suffix = f"（{'、'.join(detail_parts)}）" if detail_parts else ""
-                msg_text = f"{account.label} 同步完成，新增 {inserted} 封邮件{detail_suffix}"
-            else:
-                msg_text = f"{account.label} 同步完成，各文件夹均为最新状态"
-            account_repo.add_sync_log(db, account.id, "success", inserted, msg_text)
-            return True, inserted, msg_text
-        except Exception as exc:
-            logger.exception("Sync failed for account %s", account.email)
-            friendly_err = format_mail_auth_error(exc, account.provider)
-            account.sync_status = "error"
-            account.last_error = friendly_err
-            account_repo.save(db, account)
-            err_msg = f"{account.label} 同步失败：{friendly_err}"
-            account_repo.add_sync_log(db, account.id, "error", 0, err_msg)
-            return False, 0, err_msg
+                }
+                existing_uids_by_folder: dict[str, set[str]] = {
+                    folder: set(uid_map.keys()) for folder, uid_map in uid_maps.items()
+                }
+                sent_msg_id_map = email_repo.get_message_id_map_by_folder(db, account.id, "sent")
+                drafts_msg_id_map = email_repo.get_message_id_map_by_folder(db, account.id, "drafts")
+                all_account_msg_ids = email_repo.get_all_message_ids_for_account(db, account.id)
+                skip_all_uids = set(self._checked_all_mail_uids.get(account.id, set()))
+
+                loop = asyncio.get_running_loop()
+                early_state: dict[str, int] = {"inbox_inserted": 0}
+                early_inbox_source = "manual_early" if source == "manual" else source
+                account_id_val = account.id
+
+                async def _persist_early_inbox(
+                    early_msgs: list[tuple[int, bytes, bool, bool]],
+                    early_flags: dict[str, tuple[bool, bool]],
+                ) -> tuple[int, set[str]]:
+                    early_fetch = ImapSyncFetchResult(
+                        new_messages=[
+                            ("inbox", uid, raw_bytes, is_read, is_starred)
+                            for uid, raw_bytes, is_read, is_starred in early_msgs
+                        ],
+                        flag_updates={"inbox": early_flags} if early_flags else {},
+                        synced_folders=["inbox"],
+                    )
+                    with SessionLocal() as early_db:
+                        early_acc = account_repo.get_by_id(early_db, account_id_val)
+                        if early_acc is None:
+                            return 0, set()
+                        # 将 UID map 绑定到 early_db 查询对象以便更新 flags
+                        early_uid_maps = {
+                            "inbox": email_repo.get_uid_map_by_folder(early_db, account_id_val, "inbox")
+                        }
+                        early_existing = {"inbox": set(early_uid_maps["inbox"].keys())}
+                        early_mids = set(all_account_msg_ids)
+                        _ok, count, _msg = self._persist_fetch_result(
+                            early_db,
+                            early_acc,
+                            early_fetch,
+                            uid_maps=early_uid_maps,
+                            existing_uids_by_folder=early_existing,
+                            all_account_msg_ids=early_mids,
+                            mode="inbox",
+                            source=early_inbox_source,
+                            record_log=False,
+                            update_account_status=False,
+                        )
+                        newly_added_mids = early_mids - all_account_msg_ids
+                        return count, newly_added_mids
+
+                def on_inbox_ready(
+                    new_msgs: list[tuple[int, bytes, bool, bool]],
+                    flag_updates: dict[str, tuple[bool, bool]],
+                ) -> None:
+                    fut = asyncio.run_coroutine_threadsafe(
+                        _persist_early_inbox(new_msgs, flag_updates),
+                        loop,
+                    )
+                    early_count, new_mids = fut.result(timeout=30.0)
+                    early_state["inbox_inserted"] += early_count
+                    for uid, _raw, _r, _s in new_msgs:
+                        existing_uids_by_folder.setdefault("inbox", set()).add(str(uid))
+                    all_account_msg_ids.update(new_mids)
+
+                fetch_result = await asyncio.to_thread(
+                    _fetch_imap_folder_messages,
+                    host=account.imap_host,
+                    port=account.imap_port,
+                    use_ssl=account.imap_ssl,
+                    email_addr=account.email,
+                    secret=secret,
+                    auth_type=account.auth_type,
+                    provider=account.provider,
+                    sync_days=sync_days,
+                    existing_uids_by_folder=existing_uids_by_folder,
+                    known_message_ids=all_account_msg_ids,
+                    skip_all_mail_uids=skip_all_uids,
+                    on_inbox_ready=on_inbox_ready,
+                )
+
+                db.refresh(account)
+                return self._persist_fetch_result(
+                    db,
+                    account,
+                    fetch_result,
+                    uid_maps=uid_maps,
+                    existing_uids_by_folder=existing_uids_by_folder,
+                    sent_msg_id_map=sent_msg_id_map,
+                    drafts_msg_id_map=drafts_msg_id_map,
+                    all_account_msg_ids=all_account_msg_ids,
+                    mode="full",
+                    source=source,
+                    prior_inserted_by_folder={"inbox": early_state["inbox_inserted"]},
+                )
+            except Exception as exc:
+                logger.exception("Sync failed for account %s", account.email)
+                friendly_err = format_mail_auth_error(exc, account.provider)
+                prev_error = account.last_error
+                account.sync_status = "error"
+                account.last_error = friendly_err
+                account_repo.save(db, account)
+                err_msg = f"{account.label} 同步失败：{friendly_err}"
+                if source == "manual" or prev_error != friendly_err:
+                    account_repo.add_sync_log(db, account.id, "error", 0, err_msg)
+                return False, 0, err_msg
 
 
 imap_sync_service = ImapSyncService()

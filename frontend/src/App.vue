@@ -49,8 +49,22 @@ function handleGlobalShortcut(event: KeyboardEvent): void {
 }
 
 onMounted(async () => {
+  try {
+    const currentUrl = new URL(window.location.href)
+    if (currentUrl.searchParams.has('v')) {
+      currentUrl.searchParams.delete('v')
+      const qs = currentUrl.searchParams.toString()
+      window.history.replaceState(null, '', `${currentUrl.pathname}${qs ? `?${qs}` : ''}${currentUrl.hash}`)
+    }
+  } catch {
+    // 忽略异常环境下的地址栏清理
+  }
   window.addEventListener('keydown', handleGlobalShortcut)
-  await store.bootstrap()
+  try {
+    await store.bootstrap()
+  } finally {
+    store.connectRealtimeEvents()
+  }
   if (store.shouldAutoStartOnboarding()) {
     window.setTimeout(() => {
       if (!store.composeOpen && !store.settingsOpen) {
@@ -62,6 +76,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener('keydown', handleGlobalShortcut)
+  store.disconnectRealtimeEvents()
 })
 </script>
 

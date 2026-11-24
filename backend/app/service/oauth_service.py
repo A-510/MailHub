@@ -274,6 +274,9 @@ class OAuthService:
             session.status = "completed"
             session.message = f"账号 {saved.email} 授权成功！"
             session.account_id = saved.id
+            from app.service.scheduler_service import scheduler_service
+
+            scheduler_service.notify_accounts_changed(force_restart_account_id=saved.id)
             return True, session.message, saved
         except Exception as exc:
             logger.exception("OAuth2 callback exchange failed")

@@ -97,15 +97,35 @@ def delete_account(account_id: int, db: Session = Depends(get_db)) -> dict[str, 
 
 
 @router.post("/accounts/sync-all")
-async def sync_all_accounts(db: Session = Depends(get_db)) -> dict[str, object]:
-    """手动触发全部已启用邮箱立即同步。"""
-    return await account_service.sync_all_accounts(db)
+async def sync_all_accounts(
+    inbox_only: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """手动触发全部已启用邮箱立即同步（支持 inbox_only 快速查新）。"""
+    return await account_service.sync_all_accounts(db, inbox_only=inbox_only, source="manual")
+
+
+@router.post("/accounts/quick-check")
+async def quick_check_accounts(
+    account_id: int | None = Query(default=None),
+) -> dict[str, object]:
+    """唤醒实时长连接或轻量增量检查收件箱新邮件。"""
+    return await account_service.quick_check_accounts(account_id=account_id)
 
 
 @router.post("/accounts/{account_id}/sync")
-async def sync_single_account(account_id: int, db: Session = Depends(get_db)) -> dict[str, object]:
+async def sync_single_account(
+    account_id: int,
+    inbox_only: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
     """手动触发指定邮箱立即同步。"""
     try:
-        return await account_service.sync_single_account(db, account_id)
+        return await account_service.sync_single_account(
+            db,
+            account_id,
+            inbox_only=inbox_only,
+            source="manual",
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

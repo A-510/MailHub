@@ -133,6 +133,7 @@ export interface AppSettings {
   undo_send_seconds: number
   sync_interval_minutes: number
   sync_days: number
+  realtime_push: boolean
   desktop_notifications: boolean
   block_remote_images: boolean
   oauth_google_client_id: string
@@ -181,10 +182,24 @@ export interface DiagnosticsSettingsSummary {
   motion_level: string
   sync_interval_minutes: number
   sync_days: number
+  realtime_push: boolean
   undo_send_seconds: number
   block_remote_images: boolean
   oauth_google_configured: boolean
   oauth_microsoft_configured: boolean
+}
+
+export interface MailSyncedEvent {
+  account_id: number
+  account_label: string
+  notify_enabled: boolean
+  fetched_count: number
+  inbox_fetched_count: number
+  flags_updated: number
+  mode: string
+  source: string
+  latest_subject: string
+  latest_sender: string
 }
 
 export interface DiagnosticsSyncLogSummary {

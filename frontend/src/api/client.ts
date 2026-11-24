@@ -77,6 +77,14 @@ export const mailApi = {
     request<{ ok: boolean; fetched: number; message: string }>(`/accounts/${id}/sync`, {
       method: 'POST',
     }),
+  quickCheckAccounts: (accountId?: number | null) =>
+    request<{ ok: boolean; woken: number; synced: number; throttled: number; fetched: number }>(
+      accountId != null
+        ? `/accounts/quick-check?account_id=${encodeURIComponent(accountId)}`
+        : '/accounts/quick-check',
+      { method: 'POST' },
+    ),
+  getEventsUrl: () => `${API_BASE}/events`,
 
   startOAuth: (payload: { provider: 'gmail' | 'outlook'; label?: string; email_hint?: string }) =>
     request<{ state: string; auth_url: string; browser_opened: boolean }>('/oauth/start', {

@@ -538,11 +538,20 @@ async function handleClearDemo(): Promise<void> {
   store.pushToast(`已清空 ${res.removed_accounts} 个演示邮箱及示例邮件`, 'success')
 }
 
-async function handleResetDemo(): Promise<void> {
-  await mailApi.resetDemo()
-  store.selectedAccountId = null
-  await Promise.all([store.refreshAccounts(), store.fetchEmails({ selectFirst: true }), loadStorage()])
-  store.pushToast('已恢复默认演示邮箱与示例邮件', 'success')
+function handleResetDemo(): Promise<void> {
+  return mailApi.resetDemo().then(async () => {
+    store.selectedAccountId = null
+    await Promise.all([store.refreshAccounts(), store.fetchEmails({ selectFirst: true }), loadStorage()])
+    store.pushToast('已恢复默认演示邮箱与示例邮件', 'success')
+  })
+}
+
+function handleToggleDesktopNotifications(): void {
+  const next = !store.settings.desktop_notifications
+  void store.updateSettings({ desktop_notifications: next })
+  if (next && typeof Notification !== 'undefined' && Notification.permission === 'default') {
+    void Notification.requestPermission().catch(() => {})
+  }
 }
 
 function formatBytes(bytes: number): string {
@@ -1116,7 +1125,21 @@ onUnmounted(() => {
 
               <div class="setting-row">
                 <div>
+                  <strong>实时推送收信（IMAP IDLE 极速接收验证码）</strong>
+                  <p>保持加密长连接，新邮件与验证码秒级到达（不支持的邮箱自动 5 秒极速检测）</p>
+                </div>
+                <input
+                  type="checkbox"
+                  class="toggle-switch"
+                  :checked="store.settings.realtime_push"
+                  @change="store.updateSettings({ realtime_push: !store.settings.realtime_push })"
+                />
+              </div>
+
+              <div class="setting-row">
+                <div>
                   <strong>后台自动同步频率</strong>
+                  <p>控制定时全量文件夹与已读/星标同步；选「仅手动同步」将同时暂停实时推送</p>
                 </div>
                 <select
                   :value="store.settings.sync_interval_minutes"
@@ -1188,7 +1211,7 @@ onUnmounted(() => {
                   type="checkbox"
                   class="toggle-switch"
                   :checked="store.settings.desktop_notifications"
-                  @change="store.updateSettings({ desktop_notifications: !store.settings.desktop_notifications })"
+                  @change="handleToggleDesktopNotifications"
                 />
               </div>
 

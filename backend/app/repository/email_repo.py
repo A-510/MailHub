@@ -231,6 +231,15 @@ class EmailRepository:
         items = db.scalars(stmt).all()
         return {item.message_uid: item for item in items if item.message_uid}
 
+    def get_uids_by_folder(self, db: Session, account_id: int, folder: str) -> set[str]:
+        """仅查询指定账号指定文件夹下的 UID 集合（避免加载正文，适合高频增量检查）。"""
+        stmt = select(Email.message_uid).where(
+            Email.account_id == account_id,
+            Email.folder == folder,
+            Email.message_uid != "",
+        )
+        return {uid for uid in db.scalars(stmt).all() if uid}
+
     def get_message_id_map_by_folder(self, db: Session, account_id: int, folder: str) -> dict[str, Email]:
         """获取指定账号指定文件夹下非空 Message-ID（小写）到邮件实体映射，用于去重。"""
         stmt = select(Email).where(

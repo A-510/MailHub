@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     host: str = "127.0.0.1"
     port: int = 8765
     secret_key: str | None = None
+    enable_realtime_sync: bool = True
     project_root: Path = Path(__file__).resolve().parents[3]
 
     @property

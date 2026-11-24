@@ -33,8 +33,9 @@ from app.service.smtp_send_service import smtp_send_service
 
 
 @pytest.fixture()
-def client(tmp_path: Path):
-    """为每个测试创建独立的临时 SQLite 数据库与 FastAPI 测试客户端。"""
+def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """为每个测试创建独立的临时 SQLite 数据库与 FastAPI 测试客户端（默认关闭后台真实外网长连接）。"""
+    monkeypatch.setattr(settings, "enable_realtime_sync", False)
     db_file = tmp_path / "test_mailhub.db"
     eng = configure_database(f"sqlite:///{db_file}")
     init_db(eng)
@@ -1563,6 +1564,979 @@ def test_diagnostics_sanitization_and_bundle_export(
             assert "private.owner@" not in content
             assert "my_auth_code_99" not in content
             assert "super-secret-google-client-secret" not in content
+
+
+def test_inbox_only_sync_skips_other_folders_and_uses_uid_incremental(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 inbox_only 快速同步跳过 list_folders，并使用 UIDNEXT 与 UID <max+1>:* 增量拉取验证码邮件。"""
+    import app.service.imap_sync_service as sync_mod
+
+    client.post("/api/v1/system/demo/clear")
+    acc = client.post(
+        "/api/v1/accounts",
+        json={
+            "label": "QQ 验证码测试",
+            "email": "fast_qq@qq.com",
+            "provider": "qq",
+            "auth_type": "password",
+            "secret": "qq_code",
+        },
+    ).json()
+
+    state: dict[str, object] = {
+        "list_folders_calls": 0,
+        "select_calls": [],
+        "search_calls": [],
+        "fetch_calls": [],
+        "uidnext": 101,
+        "messages": {
+            100: (
+                _build_rfc822_email(
+                    sender="System <noreply@example.com>",
+                    to="fast_qq@qq.com",
+                    subject="初始欢迎邮件",
+                    body="welcome",
+                    message_id="<init-100@example.com>",
+                ),
+                (),
+            )
+        },
+    }
+
+    class FastInboxFakeImap:
+        def list_folders(self) -> list[tuple[object, object, object]]:
+            state["list_folders_calls"] = int(state["list_folders_calls"]) + 1  # type: ignore[arg-type]
+            return [((b"\\HasNoChildren",), b"/", "INBOX")]
+
+        def select_folder(self, folder: str, readonly: bool = True) -> dict[bytes, object]:
+            state["select_calls"].append(folder)  # type: ignore[attr-defined]
+            return {b"EXISTS": len(state["messages"]), b"UIDNEXT": state["uidnext"]}  # type: ignore[arg-type]
+
+        def search(self, criteria: list[object]) -> list[int]:
+            state["search_calls"].append(list(criteria))  # type: ignore[attr-defined]
+            msgs: dict[int, tuple[bytes, tuple[bytes, ...]]] = state["messages"]  # type: ignore[assignment]
+            return sorted(msgs.keys())
+
+        def fetch(self, uids: list[int], parts: list[str]) -> dict[int, dict[bytes, object]]:
+            state["fetch_calls"].append((list(uids), list(parts)))  # type: ignore[attr-defined]
+            msgs: dict[int, tuple[bytes, tuple[bytes, ...]]] = state["messages"]  # type: ignore[assignment]
+            body_key = b"BODY[]" if "BODY.PEEK[]" in parts else b"RFC822"
+            return {
+                uid: {b"FLAGS": msgs[uid][1], body_key: msgs[uid][0]}
+                for uid in uids
+                if uid in msgs
+            }
+
+        def logout(self) -> None:
+            return None
+
+    monkeypatch.setattr(sync_mod, "_imap_connect_and_auth", lambda **_kw: FastInboxFakeImap())
+
+    # 第 1 次：空库 inbox_only 同步，拉取 UID 100，绝不调用 list_folders
+    res1 = client.post(f"/api/v1/accounts/{acc['id']}/sync", params={"inbox_only": True}).json()
+    assert res1["ok"] is True
+    assert res1["fetched"] == 1
+    assert state["list_folders_calls"] == 0
+    assert state["select_calls"] == ["INBOX"]
+
+    # 第 2 次：UIDNEXT == 101 == max_known_uid + 1，直接短路返回，连 search/fetch 都不必执行
+    state["search_calls"].clear()  # type: ignore[attr-defined]
+    state["fetch_calls"].clear()  # type: ignore[attr-defined]
+    res2 = client.post(f"/api/v1/accounts/{acc['id']}/sync", params={"inbox_only": True}).json()
+    assert res2["ok"] is True
+    assert res2["fetched"] == 0
+    assert state["search_calls"] == []
+    assert state["fetch_calls"] == []
+
+    # 第 3 次：服务端新到 UID 101 验证码邮件（UIDNEXT=102），触发 UID 101:* 增量检索且只拉取 UID 101
+    state["uidnext"] = 102
+    state["messages"][101] = (  # type: ignore[index]
+        _build_rfc822_email(
+            sender="Auth <auth@app.example>",
+            to="fast_qq@qq.com",
+            subject="您的验证码为 654321",
+            body="验证码：654321",
+            message_id="<otp-101@app.example>",
+        ),
+        (),
+    )
+    res3 = client.post(f"/api/v1/accounts/{acc['id']}/sync", params={"inbox_only": True}).json()
+    assert res3["ok"] is True
+    assert res3["fetched"] == 1
+    assert state["search_calls"] == [["UID", "101:*"]]
+    assert state["fetch_calls"] == [([101], ["BODY.PEEK[]", "FLAGS"])]
+
+    items = client.get("/api/v1/emails", params={"account_id": acc["id"], "folder": "inbox"}).json()["items"]
+    assert [it["subject"] for it in items] == ["您的验证码为 654321", "初始欢迎邮件"]
+
+
+@pytest.mark.anyio
+async def test_imap_idle_realtime_push_delivers_verification_code_and_broadcasts_sse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 IMAP IDLE 收到 EXISTS 推送后秒级拉取验证码入库并通过 /api/v1/events SSE 实时推送前端。"""
+    import asyncio
+    import json
+    import threading
+    import time
+    import httpx
+    import app.service.imap_sync_service as sync_mod
+    import app.service.realtime_sync_service as rt_mod
+    from app.service.crypto_service import crypto_service
+
+    db_file = tmp_path / "test_idle_sse.db"
+    eng = configure_database(f"sqlite:///{db_file}")
+    init_db(eng)
+    monkeypatch.setattr(settings, "enable_realtime_sync", True)
+    monkeypatch.setattr(rt_mod, "IDLE_SLICE_SECONDS", 0.05)
+    monkeypatch.setattr(rt_mod, "DEFAULT_IDLE_REFRESH_SECONDS", 5.0)
+
+    with SessionLocal() as db:
+        acc = Account(
+            label="IDLE实时邮箱",
+            email="idle_user@qq.com",
+            provider="qq",
+            auth_type="password",
+            encrypted_secret=crypto_service.encrypt("auth_code"),
+            imap_host="imap.qq.com",
+            imap_port=993,
+            imap_ssl=True,
+            smtp_host="smtp.qq.com",
+            smtp_port=465,
+            smtp_ssl=True,
+            is_enabled=True,
+            is_demo=False,
+        )
+        acc = account_repo.create(db, acc)
+        account_id = acc.id
+
+    entered_idle = threading.Event()
+    push_trigger = threading.Event()
+    exited_idle = threading.Event()
+    server_messages: dict[int, tuple[bytes, tuple[bytes, ...]]] = {
+        10: (
+            _build_rfc822_email(
+                sender="Welcome <hi@example.com>",
+                to="idle_user@qq.com",
+                subject="旧邮件",
+                body="old",
+                message_id="<old-10@example.com>",
+            ),
+            (b"\\Seen",),
+        )
+    }
+
+    select_readonly_calls: list[bool] = []
+    fetch_parts_calls: list[list[str]] = []
+
+    class FakeIdleImap:
+        def __init__(self) -> None:
+            self._pushed = False
+
+        def socket(self) -> None:
+            return None
+
+        def has_capability(self, cap: object) -> bool:
+            return str(cap).upper().endswith("IDLE") or cap == b"IDLE"
+
+        def select_folder(self, _folder: str, readonly: bool = True) -> dict[bytes, object]:
+            select_readonly_calls.append(readonly)
+            return {b"EXISTS": len(server_messages), b"UIDNEXT": max(server_messages.keys()) + 1}
+
+        def search(self, _criteria: list[object]) -> list[int]:
+            return sorted(server_messages.keys())
+
+        def fetch(self, uids: list[int], parts: list[str]) -> dict[int, dict[bytes, object]]:
+            fetch_parts_calls.append(list(parts))
+            body_key = b"BODY[]" if "BODY.PEEK[]" in parts else b"RFC822"
+            return {
+                uid: {b"FLAGS": server_messages[uid][1], body_key: server_messages[uid][0]}
+                for uid in uids
+                if uid in server_messages
+            }
+
+        def noop(self) -> tuple[bytes, list[object]]:
+            return (b"NOOP ok", [])
+
+        def idle(self) -> None:
+            entered_idle.set()
+
+        def idle_check(self, timeout: float = 1.0) -> list[tuple[int, bytes]]:
+            if not self._pushed:
+                if push_trigger.wait(timeout=timeout):
+                    self._pushed = True
+                    return [(len(server_messages), b"EXISTS")]
+                return []
+            time.sleep(timeout)
+            return []
+
+        def idle_done(self) -> tuple[bytes, list[object]]:
+            exited_idle.set()
+            return (b"Idle terminated", [])
+
+        def logout(self) -> None:
+            return None
+
+    monkeypatch.setattr(sync_mod, "_imap_connect_and_auth", lambda **_kw: FakeIdleImap())
+
+    app = create_app()
+    sse_chunks: asyncio.Queue[bytes] = asyncio.Queue()
+    disconnect_event = asyncio.Event()
+
+    async def asgi_receive() -> dict[str, object]:
+        await disconnect_event.wait()
+        return {"type": "http.disconnect"}
+
+    async def asgi_send(message: dict[str, object]) -> None:
+        if message["type"] == "http.response.body":
+            body = message.get("body", b"")
+            if body:
+                await sse_chunks.put(bytes(body))
+            if not message.get("more_body", False):
+                await sse_chunks.put(b"__EOF__")
+
+    sse_scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/api/v1/events",
+        "raw_path": b"/api/v1/events",
+        "query_string": b"",
+        "headers": [],
+        "server": ("test", 80),
+        "client": ("127.0.0.1", 12345),
+        "root_path": "",
+    }
+
+    async with app.router.lifespan_context(app):
+        sse_task = asyncio.create_task(app(sse_scope, asgi_receive, asgi_send))
+        try:
+            # 读取初始 connected 事件帧
+            first_chunk = (await asyncio.wait_for(sse_chunks.get(), timeout=3.0)).decode("utf-8")
+            assert "event: connected" in first_chunk
+            assert '"ok": true' in first_chunk
+
+            # 等待长连接进入 IDLE 等待态
+            ok_entered = await asyncio.to_thread(entered_idle.wait, 3.0)
+            assert ok_entered is True
+
+            # 模拟应用发送验证码邮件并通过 IDLE 推送 EXISTS
+            server_messages[11] = (
+                _build_rfc822_email(
+                    sender="某应用安全中心 <security@app.example>",
+                    to="idle_user@qq.com",
+                    subject="【某应用】您的登录验证码是 849201",
+                    body="验证码 849201，5分钟内有效",
+                    message_id="<otp-849201@app.example>",
+                ),
+                (),
+            )
+            push_trigger.set()
+
+            # 读取 SSE 实时广播出的 mail_synced 事件
+            synced_payload: dict[str, object] | None = None
+            buffer = ""
+            for _ in range(20):
+                chunk = await asyncio.wait_for(sse_chunks.get(), timeout=3.0)
+                if chunk == b"__EOF__":
+                    break
+                buffer += chunk.decode("utf-8")
+                while "\n\n" in buffer:
+                    frame, buffer = buffer.split("\n\n", 1)
+                    evt_name = ""
+                    evt_data = ""
+                    for line in frame.splitlines():
+                        if line.startswith("event: "):
+                            evt_name = line[7:].strip()
+                        elif line.startswith("data: "):
+                            evt_data = line[6:].strip()
+                    if evt_name == "mail_synced" and evt_data:
+                        candidate = json.loads(evt_data)
+                        if int(candidate.get("fetched_count", 0)) == 1 and "849201" in str(
+                            candidate.get("latest_subject", "")
+                        ):
+                            synced_payload = candidate
+                            break
+                if synced_payload is not None:
+                    break
+
+            assert synced_payload is not None
+            assert synced_payload["account_id"] == account_id
+            assert synced_payload["source"] == "idle"
+            assert synced_payload["inbox_fetched_count"] == 1
+            assert "849201" in str(synced_payload["latest_subject"])
+            assert False in select_readonly_calls
+            assert ["BODY.PEEK[]", "FLAGS"] in fetch_parts_calls
+
+            # 确认验证码邮件已去重入库且仅有 1 封匹配记录
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+                list_res = await ac.get("/api/v1/emails", params={"account_id": account_id, "folder": "inbox"})
+                assert list_res.status_code == 200
+                subjects = [it["subject"] for it in list_res.json()["items"]]
+                assert subjects.count("【某应用】您的登录验证码是 849201") == 1
+                assert "旧邮件" in subjects
+        finally:
+            disconnect_event.set()
+            await asyncio.wait_for(sse_task, timeout=3.0)
+
+    # 额外验证 lifespan 关闭时 close_all() 能立刻终止仍在监听的 SSE 流而不挂起
+    sse_chunks_2: asyncio.Queue[bytes] = asyncio.Queue()
+    disconnect_event_2 = asyncio.Event()
+
+    async def asgi_receive_2() -> dict[str, object]:
+        await disconnect_event_2.wait()
+        return {"type": "http.disconnect"}
+
+    async def asgi_send_2(message: dict[str, object]) -> None:
+        if message["type"] == "http.response.body" and not message.get("more_body", False):
+            await sse_chunks_2.put(b"__EOF__")
+
+    async with app.router.lifespan_context(app):
+        sse_task_2 = asyncio.create_task(app(sse_scope, asgi_receive_2, asgi_send_2))
+        await asyncio.sleep(0.05)
+
+    # lifespan 退出已触发 mail_event_bus.close_all()，无需 disconnect_event_2 SSE 任务也应已退出
+    await asyncio.wait_for(sse_task_2, timeout=3.0)
+    assert exited_idle.is_set()
+
+
+@pytest.mark.anyio
+async def test_non_idle_server_falls_back_to_fast_poll_and_quick_check_wakes_immediately(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证不支持 IDLE 的服务器自动降级为 15s 快速长连接轮询，且 quick-check 可零等待唤醒收信。"""
+    import asyncio
+    import threading
+    import httpx
+    import app.service.imap_sync_service as sync_mod
+    import app.service.realtime_sync_service as rt_mod
+    from app.service.crypto_service import crypto_service
+
+    db_file = tmp_path / "test_fast_poll.db"
+    eng = configure_database(f"sqlite:///{db_file}")
+    init_db(eng)
+    monkeypatch.setattr(settings, "enable_realtime_sync", True)
+    monkeypatch.setattr(rt_mod, "FAST_POLL_INTERVAL_SECONDS", 15.0)
+
+    with SessionLocal() as db:
+        acc = Account(
+            label="无IDLE邮箱",
+            email="noidle@example.com",
+            provider="custom",
+            auth_type="password",
+            encrypted_secret=crypto_service.encrypt("pass123"),
+            imap_host="imap.example.com",
+            imap_port=993,
+            imap_ssl=True,
+            smtp_host="smtp.example.com",
+            smtp_port=465,
+            smtp_ssl=True,
+            is_enabled=True,
+            is_demo=False,
+        )
+        acc = account_repo.create(db, acc)
+        account_id = acc.id
+
+    initial_checked = threading.Event()
+    noop_called = threading.Event()
+    server_messages: dict[int, tuple[bytes, tuple[bytes, ...]]] = {
+        20: (
+            _build_rfc822_email(
+                sender="Init <init@example.com>",
+                to="noidle@example.com",
+                subject="初始邮件",
+                body="init",
+                message_id="<init-20@example.com>",
+            ),
+            (b"\\Seen",),
+        )
+    }
+
+    class NonIdleFakeImap:
+        def socket(self) -> None:
+            return None
+
+        def has_capability(self, _cap: object) -> bool:
+            return False
+
+        def select_folder(self, _folder: str, readonly: bool = True) -> dict[bytes, object]:
+            return {b"EXISTS": len(server_messages), b"UIDNEXT": max(server_messages.keys()) + 1}
+
+        def search(self, _criteria: list[object]) -> list[int]:
+            initial_checked.set()
+            return sorted(server_messages.keys())
+
+        def fetch(self, uids: list[int], _parts: list[str]) -> dict[int, dict[bytes, object]]:
+            return {
+                uid: {b"FLAGS": server_messages[uid][1], b"RFC822": server_messages[uid][0]}
+                for uid in uids
+                if uid in server_messages
+            }
+
+        def noop(self) -> tuple[bytes, list[object]]:
+            noop_called.set()
+            return (b"NOOP ok", [])
+
+        def idle(self) -> None:
+            raise AssertionError("Non-IDLE server must not call idle()")
+
+        def logout(self) -> None:
+            return None
+
+    monkeypatch.setattr(sync_mod, "_imap_connect_and_auth", lambda **_kw: NonIdleFakeImap())
+
+    # 1. 验证 quick-check 在 15s 周期内立即唤醒沉睡中的 fast_poll 监控器
+    app = create_app()
+    async with app.router.lifespan_context(app):
+        assert await asyncio.to_thread(initial_checked.wait, 3.0)
+        handle = rt_mod.realtime_sync_manager._handles.get(account_id)
+        assert handle is not None
+        assert handle.mode == "fast_poll"
+
+        server_messages[21] = (
+            _build_rfc822_email(
+                sender="Verify <v@app.example>",
+                to="noidle@example.com",
+                subject="切窗唤醒验证码 112233",
+                body="code 112233",
+                message_id="<otp-21@app.example>",
+            ),
+            (),
+        )
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            qc_res = await ac.post("/api/v1/accounts/quick-check", params={"account_id": account_id})
+            assert qc_res.status_code == 200
+            assert qc_res.json()["woken"] == 1
+
+            assert await asyncio.to_thread(noop_called.wait, 3.0)
+            # 等待入库完成
+            for _ in range(30):
+                list_res = await ac.get("/api/v1/emails", params={"account_id": account_id, "folder": "inbox"})
+                subjects = [it["subject"] for it in list_res.json()["items"]]
+                if "切窗唤醒验证码 112233" in subjects:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                raise AssertionError("Quick-check did not persist awakened email in time")
+
+    # 2. 验证 fast_poll 周期到达时在同一连接自动拉取新邮件
+    stop_ev = threading.Event()
+    check_ev = threading.Event()
+    ingested_sources: list[str] = []
+
+    def fake_ingest(res: sync_mod.ImapSyncFetchResult, src: str) -> set[str]:
+        ingested_sources.append(src)
+        if len(res.new_messages) >= 1 and 22 in [m[1] for m in res.new_messages]:
+            stop_ev.set()
+        return {str(uid) for uid in server_messages.keys()}
+
+    server_messages[22] = (
+        _build_rfc822_email(
+            sender="AutoPoll <poll@app.example>",
+            to="noidle@example.com",
+            subject="自动快速轮询验证码 998877",
+            body="998877",
+            message_id="<otp-22@app.example>",
+        ),
+        (),
+    )
+    await asyncio.to_thread(
+        rt_mod._run_account_watch_session,
+        account_id=account_id,
+        host="imap.example.com",
+        port=993,
+        use_ssl=True,
+        email_addr="noidle@example.com",
+        secret="pass123",
+        auth_type="password",
+        provider="custom",
+        sync_days=30,
+        known_uids={"20", "21"},
+        stop_event=stop_ev,
+        check_now_event=check_ev,
+        ingest_callback=fake_ingest,
+        fast_poll_interval=0.05,
+    )
+    assert "fast_poll" in ingested_sources
+
+
+@pytest.mark.anyio
+async def test_idle_eof_guard_and_settings_toggle_stops_watchers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 IDLE 遇到对端 EOF 立即退出避免 CPU 空转，以及关闭开关/设为手动同步时立即停止监控器。"""
+    import asyncio
+    import threading
+    import httpx
+    import app.service.imap_sync_service as sync_mod
+    import app.service.realtime_sync_service as rt_mod
+    from app.service.crypto_service import crypto_service
+
+    # Part A: 验证 EOF 空转防护
+    eof_check_calls = 0
+
+    class FakeEofImap:
+        def socket(self) -> None:
+            return None
+
+        def has_capability(self, _cap: object) -> bool:
+            return True
+
+        def select_folder(self, _folder: str, readonly: bool = True) -> dict[bytes, object]:
+            return {b"EXISTS": 1, b"UIDNEXT": 2}
+
+        def idle(self) -> None:
+            return None
+
+        def idle_check(self, timeout: float = 1.0) -> list[object]:
+            nonlocal eof_check_calls
+            eof_check_calls += 1
+            return []
+
+        def idle_done(self) -> tuple[bytes, list[object]]:
+            return (b"", [])
+
+        def logout(self) -> None:
+            return None
+
+    monkeypatch.setattr(sync_mod, "_imap_connect_and_auth", lambda **_kw: FakeEofImap())
+    with pytest.raises(ConnectionResetError, match="EOF"):
+        rt_mod._run_account_watch_session(
+            account_id=1,
+            host="imap.qq.com",
+            port=993,
+            use_ssl=True,
+            email_addr="eof@qq.com",
+            secret="code",
+            auth_type="password",
+            provider="qq",
+            sync_days=30,
+            known_uids={"1"},
+            stop_event=threading.Event(),
+            check_now_event=threading.Event(),
+            ingest_callback=lambda _res, _src: {"1"},
+            idle_slice_seconds=1.0,
+        )
+    assert eof_check_calls == 2
+
+    # Part B: 验证设置变更（realtime_push=False 与 sync_interval_minutes=0）立即启停长连接
+    db_file = tmp_path / "test_toggle_watchers.db"
+    eng = configure_database(f"sqlite:///{db_file}")
+    init_db(eng)
+    monkeypatch.setattr(settings, "enable_realtime_sync", True)
+    monkeypatch.setattr(rt_mod, "IDLE_SLICE_SECONDS", 0.05)
+
+    with SessionLocal() as db:
+        acc = Account(
+            label="开关测试邮箱",
+            email="toggle@qq.com",
+            provider="qq",
+            auth_type="password",
+            encrypted_secret=crypto_service.encrypt("code"),
+            imap_host="imap.qq.com",
+            imap_port=993,
+            imap_ssl=True,
+            smtp_host="smtp.qq.com",
+            smtp_port=465,
+            smtp_ssl=True,
+            is_enabled=True,
+            is_demo=False,
+        )
+        account_repo.create(db, acc)
+
+    idle_entered = threading.Event()
+    idle_exited = threading.Event()
+
+    class ToggleFakeImap:
+        def socket(self) -> None:
+            return None
+
+        def has_capability(self, _cap: object) -> bool:
+            return True
+
+        def select_folder(self, _folder: str, readonly: bool = True) -> dict[bytes, object]:
+            return {b"EXISTS": 0, b"UIDNEXT": 1}
+
+        def search(self, _criteria: list[object]) -> list[int]:
+            return []
+
+        def idle(self) -> None:
+            idle_entered.set()
+
+        def idle_check(self, timeout: float = 1.0) -> list[object]:
+            threading.Event().wait(timeout)
+            return []
+
+        def idle_done(self) -> tuple[bytes, list[object]]:
+            idle_exited.set()
+            return (b"Idle terminated", [])
+
+        def logout(self) -> None:
+            return None
+
+    monkeypatch.setattr(sync_mod, "_imap_connect_and_auth", lambda **_kw: ToggleFakeImap())
+
+    app = create_app()
+    async with app.router.lifespan_context(app):
+        assert await asyncio.to_thread(idle_entered.wait, 3.0)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+            # 1. 关闭 realtime_push 应立即唤醒调度器停止长连接
+            res_off = await ac.patch("/api/v1/settings", json={"realtime_push": False})
+            assert res_off.status_code == 200
+            assert res_off.json()["realtime_push"] is False
+            assert await asyncio.to_thread(idle_exited.wait, 3.0)
+            assert len(rt_mod.realtime_sync_manager._handles) == 0
+
+            # 2. 重新开启 realtime_push 应立即重连
+            idle_entered.clear()
+            idle_exited.clear()
+            res_on = await ac.patch("/api/v1/settings", json={"realtime_push": True})
+            assert res_on.status_code == 200
+            assert await asyncio.to_thread(idle_entered.wait, 3.0)
+
+            # 3. 切换为仅手动同步 (sync_interval_minutes=0) 应同时暂停实时推送
+            res_manual = await ac.patch("/api/v1/settings", json={"sync_interval_minutes": 0})
+            assert res_manual.status_code == 200
+            assert await asyncio.to_thread(idle_exited.wait, 3.0)
+            assert len(rt_mod.realtime_sync_manager._handles) == 0
+
+
+@pytest.mark.anyio
+async def test_sync_all_runs_concurrently_and_per_account_lock_prevents_duplicates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证多账号同步真正并发执行（不串行阻塞），且同一账号并发触发时锁机制防止重复入库。"""
+    import asyncio
+    import threading
+    import time
+    import app.service.imap_sync_service as sync_mod
+    from app.service.account_service import account_service
+    from app.service.crypto_service import crypto_service
+
+    db_file = tmp_path / "test_concurrent.db"
+    eng = configure_database(f"sqlite:///{db_file}")
+    init_db(eng)
+    monkeypatch.setattr(settings, "enable_realtime_sync", False)
+
+    with SessionLocal() as db:
+        acc1 = account_repo.create(
+            db,
+            Account(
+                label="并发账号1",
+                email="c1@qq.com",
+                provider="qq",
+                auth_type="password",
+                encrypted_secret=crypto_service.encrypt("p1"),
+                imap_host="imap.qq.com",
+                imap_port=993,
+                imap_ssl=True,
+                smtp_host="smtp.qq.com",
+                smtp_port=465,
+                smtp_ssl=True,
+                is_enabled=True,
+                is_demo=False,
+            ),
+        )
+        acc2 = account_repo.create(
+            db,
+            Account(
+                label="并发账号2",
+                email="c2@163.com",
+                provider="163",
+                auth_type="password",
+                encrypted_secret=crypto_service.encrypt("p2"),
+                imap_host="imap.163.com",
+                imap_port=993,
+                imap_ssl=True,
+                smtp_host="smtp.163.com",
+                smtp_port=465,
+                smtp_ssl=True,
+                is_enabled=True,
+                is_demo=False,
+            ),
+        )
+        acc1_id, acc2_id = acc1.id, acc2.id
+
+    barrier = threading.Barrier(2, timeout=3.0)
+
+    def fake_fetch_concurrent(**kwargs: object) -> sync_mod.ImapSyncFetchResult:
+        addr = str(kwargs["email_addr"])
+        barrier.wait()
+        raw = _build_rfc822_email(
+            sender="Sender <s@example.com>",
+            to=addr,
+            subject=f"并发邮件-{addr}",
+            body="body",
+            message_id=f"<concurrent-{addr}@example.com>",
+        )
+        return sync_mod.ImapSyncFetchResult(new_messages=[("inbox", 10, raw, False, False)])
+
+    monkeypatch.setattr(sync_mod, "_fetch_imap_folder_messages", fake_fetch_concurrent)
+
+    with SessionLocal() as db:
+        res = await account_service.sync_all_accounts(db)
+        assert res["ok"] is True
+        assert res["fetched"] == 2
+
+    # 再验证同一账号并发两次 inbox_only 同步：锁确保第二次看到已入库的 UID 500，绝不重复插入
+    same_raw = _build_rfc822_email(
+        sender="Code <code@example.com>",
+        to="c1@qq.com",
+        subject="防重入验证码",
+        body="code",
+        message_id="<dup-500@example.com>",
+    )
+
+    def fake_fetch_inbox_same(**kwargs: object) -> sync_mod.ImapSyncFetchResult:
+        known = kwargs.get("known_inbox_uids") or set()
+        time.sleep(0.05)
+        if "500" in known:
+            return sync_mod.ImapSyncFetchResult(synced_folders=["inbox"])
+        return sync_mod.ImapSyncFetchResult(
+            new_messages=[("inbox", 500, same_raw, False, False)],
+            synced_folders=["inbox"],
+        )
+
+    monkeypatch.setattr(sync_mod, "_fetch_imap_inbox_only", fake_fetch_inbox_same)
+
+    async def _sync_acc1_once() -> tuple[bool, int, str]:
+        with SessionLocal() as inner_db:
+            a = account_repo.get_by_id(inner_db, acc1_id)
+            assert a is not None
+            return await sync_mod.imap_sync_service.sync_account(inner_db, a, inbox_only=True, source="focus")
+
+    r1, r2 = await asyncio.gather(_sync_acc1_once(), _sync_acc1_once())
+    assert (r1[1] + r2[1]) == 1
+
+    with SessionLocal() as db:
+        from sqlalchemy import func, select
+        from app.model.entities import Email
+
+        dup_count = int(
+            db.scalar(
+                select(func.count(Email.id)).where(
+                    Email.account_id == acc1_id,
+                    Email.message_uid == "500",
+                )
+            )
+            or 0
+        )
+        assert dup_count == 1
+        assert acc2_id != acc1_id
+
+
+def test_spa_index_html_disables_browser_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证服务端返回的 SPA index.html 携带禁缓存头，防止浏览器复用旧缓存 JS。"""
+    monkeypatch.setattr(settings, "enable_realtime_sync", False)
+    db_file = tmp_path / "test_spa_cache.db"
+    eng = configure_database(f"sqlite:///{db_file}")
+    init_db(eng)
+
+    dist_dir = tmp_path / "dist"
+    (dist_dir / "assets").mkdir(parents=True)
+    (dist_dir / "index.html").write_text("<html><body>MailHub</body></html>", encoding="utf-8")
+    (dist_dir / "assets" / "app-abc123.js").write_text("console.log('ok');", encoding="utf-8")
+    monkeypatch.setattr(type(settings), "frontend_dist_dir", property(lambda _self: dist_dir))
+
+    app = create_app()
+    with TestClient(app) as tc:
+        root_res = tc.get("/")
+        assert root_res.status_code == 200
+        assert root_res.headers.get("cache-control") == "no-cache, no-store, must-revalidate"
+        assert root_res.headers.get("pragma") == "no-cache"
+        assert root_res.headers.get("expires") == "0"
+
+        asset_res = tc.get("/assets/app-abc123.js")
+        assert asset_res.status_code == 200
+        assert "no-store" not in (asset_res.headers.get("cache-control") or "")
+
+
+@pytest.mark.anyio
+async def test_full_sync_persists_inbox_early_and_broadcasts_before_slow_folders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证全量同步在其余慢目录阻塞期间，会提前将收件箱新邮件落库并广播 SSE，且最终无重复计数准确。"""
+    import asyncio
+    import threading
+    from sqlalchemy import func, select
+    import app.service.imap_sync_service as sync_mod
+    from app.model.entities import Email
+    from app.service.account_service import account_service
+    from app.service.crypto_service import crypto_service
+    from app.service.event_bus import mail_event_bus
+
+    db_file = tmp_path / "test_early_inbox.db"
+    eng = configure_database(f"sqlite:///{db_file}")
+    init_db(eng)
+    monkeypatch.setattr(settings, "enable_realtime_sync", False)
+
+    with SessionLocal() as db:
+        acc = account_repo.create(
+            db,
+            Account(
+                label="早期落库测试",
+                email="early@qq.com",
+                provider="qq",
+                auth_type="password",
+                encrypted_secret=crypto_service.encrypt("qq_pass"),
+                imap_host="imap.qq.com",
+                imap_port=993,
+                imap_ssl=True,
+                smtp_host="smtp.qq.com",
+                smtp_port=465,
+                smtp_ssl=True,
+                is_enabled=True,
+                is_demo=False,
+            ),
+        )
+        acc_id = acc.id
+
+    allow_slow_folders = threading.Event()
+    inbox_msg = _build_rfc822_email(
+        sender="Bank <otp@bank.example>",
+        to="early@qq.com",
+        subject="【银行】验证码 778899",
+        body="778899",
+        message_id="<early-inbox-201@bank.example>",
+    )
+    sent_msg = _build_rfc822_email(
+        sender="Early <early@qq.com>",
+        to="friend@example.com",
+        subject="慢目录发件箱邮件",
+        body="sent body",
+        message_id="<early-sent-301@qq.com>",
+    )
+
+    class SlowOtherFoldersFakeImap:
+        def __init__(self) -> None:
+            self.current_folder = "INBOX"
+
+        def list_folders(self) -> list[tuple[object, object, object]]:
+            return [
+                ((b"\\HasNoChildren",), b"/", "INBOX"),
+                ((b"\\Sent",), b"/", "Sent Messages"),
+            ]
+
+        def select_folder(self, folder: str, readonly: bool = True) -> dict[bytes, object]:
+            self.current_folder = folder
+            if folder == "Sent Messages":
+                assert allow_slow_folders.wait(timeout=5.0)
+            return {b"EXISTS": 1}
+
+        def search(self, _criteria: list[object]) -> list[int]:
+            return [201] if self.current_folder == "INBOX" else [301]
+
+        def fetch(self, uids: list[int], _parts: list[str]) -> dict[int, dict[bytes, object]]:
+            raw = inbox_msg if self.current_folder == "INBOX" else sent_msg
+            return {uid: {b"FLAGS": (), b"RFC822": raw} for uid in uids}
+
+        def logout(self) -> None:
+            return None
+
+    monkeypatch.setattr(sync_mod, "_imap_connect_and_auth", lambda **_kw: SlowOtherFoldersFakeImap())
+
+    mail_event_bus.reset_for_startup()
+    sub_queue = mail_event_bus.subscribe()
+    try:
+        with SessionLocal() as db:
+            sync_task = asyncio.create_task(account_service.sync_single_account(db, acc_id))
+
+            # 在 Sent Messages 仍阻塞时，就应提前收到收件箱的 SSE 推送且本地库已有验证码邮件
+            early_evt = await asyncio.wait_for(sub_queue.get(), timeout=3.0)
+            assert early_evt is not None
+            assert early_evt["type"] == "mail_synced"
+            assert early_evt["data"]["source"] == "manual_early"
+            assert early_evt["data"]["inbox_fetched_count"] == 1
+            assert "778899" in early_evt["data"]["latest_subject"]
+            assert not sync_task.done()
+
+            with SessionLocal() as check_db:
+                inbox_subjects = list(
+                    check_db.scalars(
+                        select(Email.subject).where(Email.account_id == acc_id, Email.folder == "inbox")
+                    ).all()
+                )
+                assert inbox_subjects == ["【银行】验证码 778899"]
+
+            allow_slow_folders.set()
+            result = await asyncio.wait_for(sync_task, timeout=3.0)
+            assert result["ok"] is True
+            assert result["fetched"] == 2
+            assert "收件箱 1" in str(result["message"])
+            assert "发件箱 1" in str(result["message"])
+
+        with SessionLocal() as final_db:
+            inbox_cnt = int(
+                final_db.scalar(
+                    select(func.count(Email.id)).where(Email.account_id == acc_id, Email.folder == "inbox")
+                )
+                or 0
+            )
+            sent_cnt = int(
+                final_db.scalar(
+                    select(func.count(Email.id)).where(Email.account_id == acc_id, Email.folder == "sent")
+                )
+                or 0
+            )
+            assert inbox_cnt == 1
+            assert sent_cnt == 1
+    finally:
+        mail_event_bus.unsubscribe(sub_queue)
+
+
+def test_event_bus_subscriber_count_and_logging(caplog: pytest.LogCaptureFixture) -> None:
+    """验证事件总线精确维护订阅计数并在零订阅/有订阅广播时输出清晰诊断日志。"""
+    import logging
+    from app.service.event_bus import MailEventBus
+
+    bus = MailEventBus()
+    assert bus.subscriber_count == 0
+
+    with caplog.at_level(logging.INFO, logger="app.service.event_bus"):
+        # 无订阅者发布 mail_synced 时记录 warning 以便排查前端未连上 SSE 的问题
+        bus.publish(
+            "mail_synced",
+            {"account_id": 6, "fetched_count": 1, "source": "idle"},
+        )
+        assert "0 active subscribers" in caplog.text
+
+        caplog.clear()
+        q1 = bus.subscribe()
+        assert bus.subscriber_count == 1
+        assert "SSE client subscribed (active_subscribers=1)" in caplog.text
+
+        bus.publish(
+            "mail_synced",
+            {"account_id": 6, "fetched_count": 2, "source": "idle"},
+        )
+        assert "Published SSE mail_synced to 1 subscriber(s)" in caplog.text
+        delivered = q1.get_nowait()
+        assert delivered is not None
+        assert delivered["type"] == "mail_synced"
+        assert delivered["data"]["fetched_count"] == 2
+
+        bus.unsubscribe(q1)
+        assert bus.subscriber_count == 0
+        # 重复注销幂等，不重复打日志也不报错
+        caplog.clear()
+        bus.unsubscribe(q1)
+        assert caplog.text == ""
+
 
 
 

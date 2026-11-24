@@ -187,6 +187,7 @@ class DiagnosticsService:
             motion_level=str(raw_settings.get("motion_level", "full")),
             sync_interval_minutes=int(raw_settings.get("sync_interval_minutes", 5)),
             sync_days=int(raw_settings.get("sync_days", 30)),
+            realtime_push=bool(raw_settings.get("realtime_push", True)),
             undo_send_seconds=int(raw_settings.get("undo_send_seconds", 5)),
             block_remote_images=bool(raw_settings.get("block_remote_images", False)),
             oauth_google_configured=bool(str(raw_settings.get("oauth_google_client_id", "")).strip()),
@@ -309,6 +310,7 @@ class DiagnosticsService:
             (
                 f"- **关键设置**: 主题=`{settings_summary.theme_mode}`, 动效=`{settings_summary.motion_level}`, "
                 f"同步间隔=`{settings_summary.sync_interval_minutes}m`, 拉取范围=`{settings_summary.sync_days}d`, "
+                f"实时推送=`{settings_summary.realtime_push}`, "
                 f"外链拦截=`{settings_summary.block_remote_images}`, "
                 f"OAuth2(Google=`{settings_summary.oauth_google_configured}`, Microsoft=`{settings_summary.oauth_microsoft_configured}`)"
             ),

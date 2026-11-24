@@ -285,6 +285,7 @@ class AppSettingsOut(BaseModel):
     undo_send_seconds: int = Field(default=5, ge=0, le=30)
     sync_interval_minutes: int = Field(default=5, ge=0, le=60)
     sync_days: int = Field(default=30, ge=0, le=365)
+    realtime_push: bool = True
     desktop_notifications: bool = True
     block_remote_images: bool = False
     oauth_google_client_id: str = ""
@@ -309,6 +310,7 @@ class AppSettingsPatch(BaseModel):
     undo_send_seconds: int | None = Field(default=None, ge=0, le=30)
     sync_interval_minutes: int | None = Field(default=None, ge=0, le=60)
     sync_days: int | None = Field(default=None, ge=0, le=365)
+    realtime_push: bool | None = None
     desktop_notifications: bool | None = None
     block_remote_images: bool | None = None
     oauth_google_client_id: str | None = None
@@ -390,6 +392,7 @@ class DiagnosticsSettingsSummary(BaseModel):
     motion_level: str
     sync_interval_minutes: int
     sync_days: int
+    realtime_push: bool = True
     undo_send_seconds: int
     block_remote_images: bool
     oauth_google_configured: bool
